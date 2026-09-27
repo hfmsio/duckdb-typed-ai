@@ -1,0 +1,44 @@
+# name: test/sql/typed_ai_live.test
+# description: typed_ai against a real local model through Ollama; free. Set TYPED_AI_OLLAMA=http://localhost:11434
+# group: [sql]
+
+require typed_ai
+
+require-env TYPED_AI_OLLAMA
+
+require-env TYPED_AI_OLLAMA_MODEL
+
+statement ok
+LOAD httpfs;
+
+statement ok
+CREATE SECRET local (TYPE typed_ai, PROVIDER 'openai', MODEL '${TYPED_AI_OLLAMA_MODEL}',
+                     URL '${TYPED_AI_OLLAMA}/v1/chat/completions', USD_PER_MTOK_IN 0, USD_PER_MTOK_OUT 0);
+
+statement ok
+CREATE TABLE t AS SELECT * FROM (VALUES
+    (1, 'card declined again, I want my money back'),
+    (2, 'how do I export a dashboard to PDF?')) v(id, body);
+
+query II
+SELECT id, typed_prob(body, 'the customer wants a refund') > 0.5 FROM t ORDER BY id;
+----
+1	true
+2	false
+
+query II
+SELECT id, typed_pick(body, 'which team should handle this?', ['billing', 'technical']) FROM t ORDER BY id;
+----
+1	billing
+2	technical
+
+query I
+SELECT typed_ask(body, '{"v": 1, "type": "yes_no", "question": "wants a refund"}')::VARCHAR LIKE '%"calibrated":false%'
+FROM t WHERE id = 1;
+----
+true
+
+query I
+SELECT spent_usd FROM typed_usage();
+----
+0.0

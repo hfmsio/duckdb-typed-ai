@@ -1,0 +1,347 @@
+# name: test/sql/typed_ai_mock.test
+# description: typed_ai against test/mock_server.py: answers, cache, stop modes, breaker, setup errors
+# group: [sql]
+
+require typed_ai
+
+require-env TYPED_AI_MOCK
+
+statement ok
+LOAD httpfs;
+
+statement ok
+SET enable_external_file_cache = false;
+
+statement ok
+CREATE SECRET m (TYPE typed_ai, PROVIDER 'jev', API_KEY 'k', URL '${TYPED_AI_MOCK}/jev/v1/systemone');
+
+statement ok
+CREATE TABLE t AS SELECT * FROM (VALUES (1, 'I want a refund now!!'), (2, 'how do I export to PDF'), (3, NULL)) v(id, body);
+
+# ---- stop modes on a budget stop ----
+
+statement ok
+CREATE TABLE big AS SELECT i id, 'row ' || i body FROM range(3000) r(i);
+
+statement ok
+SET typed_max_rows = 100000;
+
+statement ok
+SET typed_budget_usd = 0.0003;
+
+statement ok
+SET typed_on_stop = 'row';
+
+# 'row': the query finishes, and every skipped row carries its reason
+query III
+SELECT count(p.value) > 0, count(p.error) > 0, any_value(p.error)
+FROM (SELECT typed_prob(body, 'q1') p FROM big);
+----
+true	true	skipped: budget of $0.0003 reached (typed_budget_usd)
+
+# Spend stays within the budget: the first request calibrates the estimate before requests run in parallel
+query I
+SELECT spent_usd <= 0.0003 FROM typed_usage();
+----
+true
+
+# 'null': the query finishes with NULL rows
+statement ok
+SET typed_on_stop = 'null';
+
+query I
+SELECT count(p) FROM (SELECT typed_prob(body, 'q2') p FROM big);
+----
+0
+
+query I
+SELECT last_query_stop_reason FROM typed_usage();
+----
+budget of $0.0003 reached (typed_budget_usd)
+
+# 'error': the query fails with what was answered and spent
+statement ok
+SET typed_on_stop = 'error';
+
+statement error
+SELECT count(typed_prob(body, 'q3')) FROM big;
+----
+<REGEX>:.*budget of \$0.0003 reached.*rows were answered and saved.*Run the query again to continue.*
+
+# A rerun after raising the budget pays only for rows not yet answered
+statement ok
+SET typed_budget_usd = 10;
+
+statement ok
+SET typed_on_stop = 'row';
+
+statement ok
+SELECT content FROM read_text('${TYPED_AI_MOCK}/reset');
+
+query I
+SELECT count(*) FROM (SELECT typed_prob(body, 'q1') p FROM big) WHERE p.error IS NULL;
+----
+3000
+
+query I
+SELECT last_query_rows_sent < 3000 AND last_query_rows_sent > 0 FROM typed_usage();
+----
+true
+
+statement ok
+RESET typed_on_stop;
+
+# ---- answers, Jev ----
+
+query IIIII
+SELECT id, typed_is(body, 'wants a refund'), typed_prob(body, 'wants a refund'),
+       typed_pick(body, 'which team?', ['billing', 'pdf', 'sales']), typed_score(body, 'anger', ['calm', 'annoyed', 'furious'])
+FROM t ORDER BY id;
+----
+1	true	0.9	billing	2.0
+2	false	0.1	pdf	0.0
+3	NULL	NULL	NULL	NULL
+
+query I
+SELECT typed_ask(body, '{"v": 1, "type": "pick", "question": "team?", "options": ["billing", "pdf"]}') FROM t WHERE id = 2;
+----
+{"type":"pick","choice":"pdf","probabilities":{"billing":0.2,"pdf":0.8},"confidence":0.7,"model":"jev-mock-1.0","calibrated":true,"error":null}
+
+# A whole row goes in as JSON
+query I
+SELECT typed_prob(t, 'wants a refund') FROM t WHERE id = 1;
+----
+0.9
+
+# ---- cache: a rerun sends nothing ----
+
+statement ok
+SELECT content FROM read_text('${TYPED_AI_MOCK}/reset');
+
+query I
+SELECT count(typed_prob(body, 'wants a refund')) FROM t;
+----
+2
+
+query I
+SELECT content FROM read_text('${TYPED_AI_MOCK}/count');
+----
+0
+
+# ---- answers, OpenAI-compatible ----
+
+statement ok
+CREATE SECRET o (TYPE typed_ai, PROVIDER 'openai', MODEL 'mock-small', URL '${TYPED_AI_MOCK}/openai/v1/chat/completions',
+                 USD_PER_MTOK_IN 0.5, USD_PER_MTOK_OUT 2);
+
+statement ok
+SET typed_profile = 'o';
+
+query IIII
+SELECT id, round(typed_prob(body, 'wants a refund'), 3), typed_pick(body, 'which team?', ['billing', 'pdf', 'sales']),
+       round(typed_score(body, 'anger', ['calm', 'annoyed', 'furious']), 3)
+FROM t WHERE id < 3 ORDER BY id;
+----
+1	0.9	billing	2.0
+2	0.1	pdf	0.0
+
+query I
+SELECT typed_ask(body, '{"v": 1, "type": "yes_no", "question": "refund?"}') FROM t WHERE id = 1;
+----
+{"type":"yes_no","probability":0.9,"model":"mock-small","calibrated":false,"error":null}
+
+# ---- breaker: the provider keeps failing ----
+
+statement ok
+CREATE SECRET down (TYPE typed_ai, PROVIDER 'jev', API_KEY 'k', URL '${TYPED_AI_MOCK}/fail500/v1/systemone');
+
+statement ok
+SET typed_profile = 'down';
+
+statement ok
+SET typed_max_retries = 0;
+
+statement ok
+SET typed_batch_size = 2;
+
+statement ok
+SET typed_concurrency = 1;
+
+statement ok
+SELECT content FROM read_text('${TYPED_AI_MOCK}/reset');
+
+statement ok
+SET typed_on_stop = 'row';
+
+query I
+SELECT count(*) FROM (SELECT typed_prob(body, 'q') p FROM big WHERE id < 40) WHERE p.error LIKE 'skipped: provider failing%';
+----
+34
+
+# 3 requests failed, then no more were sent
+query I
+SELECT content FROM read_text('${TYPED_AI_MOCK}/count');
+----
+3
+
+query I
+SELECT breaker FROM typed_usage();
+----
+open
+
+# The next query sends one probe request, and stops again when it fails
+statement ok
+SELECT content FROM read_text('${TYPED_AI_MOCK}/reset');
+
+statement ok
+SELECT typed_prob(body, 'q') FROM big WHERE id < 40;
+
+query I
+SELECT content FROM read_text('${TYPED_AI_MOCK}/count');
+----
+1
+
+# ---- setup errors stop the query in every mode ----
+
+statement ok
+CREATE SECRET bad (TYPE typed_ai, PROVIDER 'jev', API_KEY 'k', URL '${TYPED_AI_MOCK}/fail401/v1/systemone');
+
+statement ok
+SET typed_profile = 'bad';
+
+statement error
+SELECT typed_prob(body, 'q') FROM t;
+----
+the API key was rejected (HTTP 401)
+
+statement ok
+CREATE SECRET garbage (TYPE typed_ai, PROVIDER 'jev', API_KEY 'k', URL '${TYPED_AI_MOCK}/garbage/v1/systemone');
+
+statement ok
+SET typed_profile = 'garbage';
+
+statement error
+SELECT typed_prob(body, 'q') FROM t;
+----
+Jev returned no answers
+
+statement ok
+CREATE SECRET nolog (TYPE typed_ai, PROVIDER 'openai', MODEL 'r1', URL '${TYPED_AI_MOCK}/nologprobs/v1/chat/completions',
+                     USD_PER_MTOK_IN 0, USD_PER_MTOK_OUT 0);
+
+statement ok
+SET typed_profile = 'nolog';
+
+statement error
+SELECT typed_prob(body, 'q') FROM t;
+----
+returned no logprobs
+
+# ---- too-long input: refused, never cut ----
+
+statement ok
+SET typed_profile = 'm';
+
+statement ok
+SET typed_on_stop = 'row';
+
+statement ok
+SET typed_max_input_chars = 10;
+
+query II
+SELECT typed_prob('short', 'q').value, typed_prob('this is far longer than ten', 'q').error;
+----
+0.1	skipped: input of 27 characters is over typed_max_input_chars (10)
+
+# ---- paid answers are kept: pinning and eviction order ----
+# About 5,000 answers fit in 1 MB (roughly 200 bytes each); the numbers below hold for 4,000 to 8,000.
+
+statement ok
+SET typed_max_input_chars = 20000;
+
+statement ok
+RESET typed_batch_size;
+
+statement ok
+SET typed_budget_usd = 100;
+
+statement ok
+SET typed_max_rows = 1000000;
+
+statement ok
+SET typed_cache_mb = 1;
+
+# A running query never loses its own answers, even past the 1 MB limit: the same 20,000 rows asked twice in one
+# query are sent once. One thread, so the first ask of each row finishes before the second.
+statement ok
+SET threads = 1;
+
+query I
+SELECT count(typed_prob('fill ' || (i % 20000), 'q')) FROM range(40000) r(i);
+----
+40000
+
+query II
+SELECT last_query_rows_sent, cache_entries <= 8000 FROM typed_usage();
+----
+20000	true
+
+statement ok
+RESET threads;
+
+# Q0 finishes normally: its answers are the first to go when memory runs short
+statement ok
+SELECT count(typed_prob('zero ' || i, 'q0')) FROM range(4000) r(i);
+
+query I
+SELECT cache_entries BETWEEN 4000 AND 8000 FROM typed_usage();
+----
+true
+
+# Q1 is stopped by the row cap: 2,000 paid answers, 500 skipped, and its answers go last
+statement ok
+SET typed_max_rows = 2000;
+
+query II
+SELECT count(p.value), count(p.error) FROM (SELECT typed_prob('one ' || i, 'q1') p FROM range(2500) r(i));
+----
+2000	500
+
+# Q2 fills memory again
+statement ok
+SET typed_max_rows = 1000000;
+
+statement ok
+SELECT count(typed_prob('two ' || i, 'q2')) FROM range(2000) r(i);
+
+# Rerunning the stopped job pays only for its 500 missing rows: about 50 requests of 10 (DuckDB's blocks of
+# 2,048 rows can split one batch in two)
+statement ok
+SELECT content FROM read_text('${TYPED_AI_MOCK}/reset');
+
+query II
+SELECT count(p.value), count(p.error) FROM (SELECT typed_prob('one ' || i, 'q1') p FROM range(2500) r(i));
+----
+2500	0
+
+query I
+SELECT content::INTEGER BETWEEN 50 AND 52 FROM read_text('${TYPED_AI_MOCK}/count');
+----
+true
+
+query I
+SELECT last_query_rows_sent FROM typed_usage();
+----
+500
+
+# Q0's answers, from a finished job, were the ones evicted: rerunning it sends requests again
+statement ok
+SELECT content FROM read_text('${TYPED_AI_MOCK}/reset');
+
+statement ok
+SELECT count(typed_prob('zero ' || i, 'q0')) FROM range(4000) r(i);
+
+query I
+SELECT content::INTEGER > 0 FROM read_text('${TYPED_AI_MOCK}/count');
+----
+true

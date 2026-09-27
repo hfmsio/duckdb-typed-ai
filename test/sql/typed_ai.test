@@ -1,0 +1,209 @@
+# name: test/sql/typed_ai.test
+# description: typed_ai without a network: safe defaults, argument checks, profiles, dry run and the row cap
+# group: [sql]
+
+require typed_ai
+
+# Safe limits are on from the start
+query II
+SELECT name, value FROM duckdb_settings()
+WHERE name IN ('typed_max_rows', 'typed_budget_usd', 'typed_max_input_chars', 'typed_on_stop') ORDER BY name;
+----
+typed_budget_usd	1.0
+typed_max_input_chars	20000
+typed_max_rows	1000
+typed_on_stop	error
+
+# Safety net: this file must never pay for a call, even with TYPESAFE_API_KEY set
+statement ok
+SET typed_budget_usd = 0;
+
+# NULL in, NULL out, with no profile or key needed
+query II
+SELECT typed_prob(NULL::VARCHAR, 'q'), typed_pick('x', NULL, ['a', 'b']);
+----
+NULL	NULL
+
+# A profile for a public server with no key: the error says what to run. This never uses TYPESAFE_API_KEY,
+# so the file stays free even when that key is set.
+statement ok
+CREATE SECRET nokey (TYPE typed_ai, PROVIDER 'openai', MODEL 'm', USD_PER_MTOK_IN 1, USD_PER_MTOK_OUT 1);
+
+statement error
+SELECT typed_prob(v, 'q') FROM (VALUES ('a')) t(v);
+----
+no API key for profile 'nokey'
+
+statement ok
+DROP SECRET nokey;
+
+# Constant arguments are checked while the query is planned
+statement error
+SELECT typed_is(v, 'q', 1.5) FROM (VALUES ('a')) t(v);
+----
+the threshold must be between 0 and 1
+
+statement error
+SELECT typed_pick(v, 'q', ['only one']) FROM (VALUES ('a')) t(v);
+----
+typed_pick needs 2 to 255 options; it got 1
+
+statement error
+SELECT typed_score(v, 'q', ['1','2','3','4','5','6','7','8','9','10','11']) FROM (VALUES ('a')) t(v);
+----
+typed_score needs 2 to 10 levels; it got 11
+
+statement error
+SELECT typed_ask(v, '{"v": 2, "type": "yes_no", "question": "q"}') FROM (VALUES ('a')) t(v);
+----
+question version must be 1
+
+statement error
+SELECT typed_ask(v, '{"v": 1, "type": "maybe", "question": "q"}') FROM (VALUES ('a')) t(v);
+----
+"type" must be "yes_no", "pick" or "score"
+
+statement error
+SET typed_on_stop = 'sometimes';
+----
+typed_on_stop must be 'error', 'null' or 'row'
+
+statement ok
+RESET typed_on_stop;
+
+# The key is hidden in duckdb_secrets()
+statement ok
+CREATE SECRET j (TYPE typed_ai, PROVIDER 'jev', API_KEY 'ts_secret_value');
+
+query I
+SELECT secret_string LIKE '%api_key=redacted%' AND secret_string NOT LIKE '%ts_secret_value%' FROM duckdb_secrets() WHERE name = 'j';
+----
+true
+
+# An openai profile needs a model and a price before any call
+statement ok
+CREATE SECRET o (TYPE typed_ai, PROVIDER 'openai', API_KEY 'sk');
+
+statement ok
+SET typed_profile = 'o';
+
+statement error
+SELECT typed_prob(v, 'q') FROM (VALUES ('a')) t(v);
+----
+profile 'o' needs a model
+
+statement ok
+CREATE OR REPLACE SECRET o (TYPE typed_ai, PROVIDER 'openai', API_KEY 'sk', MODEL 'm');
+
+statement error
+SELECT typed_prob(v, 'q') FROM (VALUES ('a')) t(v);
+----
+profile 'o' has no price
+
+# Several secrets and none picked: the error lists them
+statement ok
+RESET typed_profile;
+
+statement error
+SELECT typed_prob(v, 'q') FROM (VALUES ('a')) t(v);
+----
+there are 2 typed_ai secrets
+
+statement error
+SET typed_profile = 'nope';
+SELECT typed_prob(v, 'q') FROM (VALUES ('a')) t(v);
+----
+no typed_ai secret with that name
+
+statement ok
+SET typed_profile = 'j';
+
+# Dry run: prices the query, sends nothing, returns NULL
+statement ok
+SET typed_dry_run = true;
+
+query I
+SELECT count(typed_prob('row ' || i, 'q')) FROM range(500) r(i);
+----
+0
+
+query II
+SELECT requests, dry_run_usd > 0 FROM typed_usage();
+----
+0	true
+
+# The row cap refuses a big query before anything is sent, and shows the safe LIMIT pattern
+statement error
+SELECT count(typed_prob('row ' || i, 'q')) FROM range(5000) r(i);
+----
+<REGEX>:.*would send more than 1000 rows.*FROM \(SELECT \* FROM t LIMIT 10\).*
+
+# A $0 price on a Jev profile cannot switch the budget off: the built-in price is a floor
+statement ok
+CREATE SECRET free_jev (TYPE typed_ai, PROVIDER 'jev', API_KEY 'k', USD_PER_MTOK_IN 0, USD_PER_MTOK_OUT 0);
+
+statement ok
+SET typed_profile = 'free_jev';
+
+statement ok
+SELECT count(typed_prob('another row ' || i, 'q')) FROM range(100) r(i);
+
+query I
+SELECT dry_run_usd > 0 FROM typed_usage();
+----
+true
+
+# Keys never cross a network unencrypted: plain http only for this computer, matched exactly
+statement ok
+CREATE SECRET plain (TYPE typed_ai, PROVIDER 'openai', MODEL 'm', API_KEY 'k',
+                     URL 'http://example.com/v1/chat/completions', USD_PER_MTOK_IN 0, USD_PER_MTOK_OUT 0);
+
+statement ok
+SET typed_profile = 'plain';
+
+statement error
+SELECT typed_prob(v, 'q') FROM (VALUES ('a')) t(v);
+----
+Use https: plain http is allowed only for localhost
+
+statement ok
+CREATE OR REPLACE SECRET plain (TYPE typed_ai, PROVIDER 'openai', MODEL 'm',
+                                URL 'https://localhost.example.com/v1/chat/completions', USD_PER_MTOK_IN 0, USD_PER_MTOK_OUT 0);
+
+statement error
+SELECT typed_prob(v, 'q') FROM (VALUES ('a')) t(v);
+----
+no API key for profile 'plain'
+
+statement ok
+CREATE OR REPLACE SECRET plain (TYPE typed_ai, PROVIDER 'openai', MODEL 'm',
+                                URL 'http://[::1]:11434/v1/chat/completions', USD_PER_MTOK_IN 0, USD_PER_MTOK_OUT 0);
+
+query I
+SELECT typed_prob(v, 'q') FROM (VALUES ('a')) t(v);
+----
+NULL
+
+statement ok
+SET typed_profile = 'free_jev';
+
+# Limits are database-wide: SET SESSION cannot raise them
+statement ok
+SET typed_max_rows = 5;
+
+statement ok
+SET SESSION typed_max_rows = 1000000;
+
+statement error
+SELECT count(typed_prob('third row ' || i, 'q')) FROM range(10) r(i);
+----
+would send more than 5 rows
+
+# An admin can freeze the limits
+statement ok
+SET lock_configuration = true;
+
+statement error
+SET typed_budget_usd = 1000;
+----
+configuration has been locked

@@ -1,0 +1,47 @@
+# name: test/sql/typed_ai_jev.test
+# description: typed_ai against the real Jev API. Costs well under $0.001. Runs only when TYPESAFE_API_KEY is set.
+# group: [sql]
+
+require typed_ai
+
+require-env TYPESAFE_API_KEY
+
+statement ok
+LOAD httpfs;
+
+# A tight budget: this file must never spend more than a tenth of a cent
+statement ok
+SET typed_budget_usd = 0.001;
+
+statement ok
+CREATE TABLE t AS SELECT * FROM (VALUES
+    (1, 'card declined again, I want my money back'),
+    (2, 'how do I export a dashboard to PDF?')) v(id, body);
+
+query II
+SELECT id, typed_is(body, 'the customer wants a refund') FROM t ORDER BY id;
+----
+1	true
+2	false
+
+query II
+SELECT id, typed_pick(body, 'which team should handle this?', ['billing', 'technical', 'sales']) FROM t ORDER BY id;
+----
+1	billing
+2	technical
+
+query I
+SELECT typed_score(body, 'how angry is the customer?', ['calm', 'annoyed', 'furious']) BETWEEN 0 AND 2 FROM t WHERE id = 1;
+----
+true
+
+query I
+SELECT typed_ask(body, '{"v": 1, "type": "yes_no", "question": "wants a refund"}')::VARCHAR LIKE '%"model":"jev-%"calibrated":true%'
+FROM t WHERE id = 1;
+----
+true
+
+query I
+SELECT spent_usd > 0 AND spent_usd < 0.001 FROM typed_usage();
+----
+true
