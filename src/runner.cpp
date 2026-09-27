@@ -55,12 +55,12 @@ HttpResult Post(ClientContext &context, const HttpCall &call, int64_t timeout_s)
 //! Sleeps in short steps so Ctrl-C is not held up. Returns false when interrupted.
 bool Sleep(ClientContext &context, double seconds) {
 	for (double waited = 0; waited < seconds; waited += 0.05) {
-		if (context.interrupted) {
+		if (context.IsInterrupted()) {
 			return false;
 		}
 		std::this_thread::sleep_for(std::chrono::milliseconds(50));
 	}
-	return !context.interrupted;
+	return !context.IsInterrupted();
 }
 
 double Jitter() {
@@ -114,8 +114,7 @@ Sent SendWithRetries(ClientContext &context, QueryState &qs, DatabaseState &db, 
 
 //! Holds one of the process-wide request slots until it goes out of scope.
 struct SlotGuard {
-	SlotGuard(DatabaseState &db, int64_t limit, const std::atomic<bool> &interrupted)
-	    : db(db), held(db.AcquireSlot(limit, interrupted)) {
+	SlotGuard(DatabaseState &db, int64_t limit, ClientContext &context) : db(db), held(db.AcquireSlot(limit, context)) {
 	}
 	~SlotGuard() {
 		if (held) {
@@ -208,8 +207,8 @@ private:
 		Claim claim(db, profile.name);
 		claim.estimate = estimate;
 		claim.reserved = true;
-		if (!db.Allow(profile.name, qs.query_id, context.interrupted, claim.is_probe)) {
-			if (context.interrupted) {
+		if (!db.Allow(profile.name, qs.query_id, context, claim.is_probe)) {
+			if (context.IsInterrupted()) {
 				return Skip(batch, "the query was cancelled");
 			}
 			return StopAndSkip(batch,
@@ -219,7 +218,7 @@ private:
 
 		Sent sent;
 		{
-			SlotGuard slot(db, settings.concurrency, context.interrupted);
+			SlotGuard slot(db, settings.concurrency, context);
 			if (!slot.held) {
 				return Skip(batch, "the query was cancelled"); // the claim releases the reservation and probe
 			}
@@ -238,7 +237,7 @@ private:
 		if (!Fatal().empty()) {
 			return "the query failed";
 		}
-		if (context.interrupted) {
+		if (context.IsInterrupted()) {
 			return "the query was cancelled";
 		}
 		return qs.StopReason();
@@ -436,7 +435,7 @@ vector<Answer> Run(ClientContext &context, QueryState &qs, OnStop mode, const ve
 	if (!fatal.empty()) {
 		throw InvalidInputException(fatal);
 	}
-	if (context.interrupted) {
+	if (context.IsInterrupted()) {
 		throw InterruptException();
 	}
 	auto reason = qs.StopReason();

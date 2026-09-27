@@ -99,14 +99,14 @@ public:
 
 	// Breaker, per profile. Allow() waits while another thread's probe request is out; false when the breaker is
 	// open or the query was cancelled while waiting. `is_probe` says this caller now owns the one probe request.
-	bool Allow(const string &profile, uint64_t query_id, const std::atomic<bool> &interrupted, bool &is_probe);
+	bool Allow(const string &profile, uint64_t query_id, ClientContext &context, bool &is_probe);
 	//! Gives up a probe that was never sent, so other threads stop waiting for it.
 	void DropProbe(const string &profile);
 	void Record(const string &profile, bool ok, int64_t fail_after, uint64_t query_id);
 	bool BreakerOpen(const string &profile);
 
 	// Requests in flight across the whole process. False when the query was cancelled while waiting.
-	bool AcquireSlot(int64_t limit, const std::atomic<bool> &interrupted);
+	bool AcquireSlot(int64_t limit, ClientContext &context);
 	void ReleaseSlot();
 
 private:

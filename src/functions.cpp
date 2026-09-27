@@ -1,3 +1,4 @@
+#include "typed_ai/compat.hpp"
 #include "typed_ai/functions.hpp"
 #include "typed_ai/json.hpp"
 #include "typed_ai/profile.hpp"
@@ -116,7 +117,7 @@ Value ResultValue(const TypedBindData &bind, const LogicalType &type, const Answ
 }
 
 void Execute(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &bind = state.expr.Cast<BoundFunctionExpression>().bind_info->Cast<TypedBindData>();
+	auto &bind = BindData(state).Cast<TypedBindData>();
 	auto &context = state.GetContext();
 	auto rows = args.size();
 	vector<bool> is_null(rows, false);
@@ -169,8 +170,7 @@ void Execute(DataChunk &args, ExpressionState &state, Vector &result) {
 		if (is_null[row]) {
 			result.SetValue(row, Value(type));
 		} else if (bind.shape == Shape::ASK) {
-			FlatVector::GetData<string_t>(result)[row] =
-			    StringVector::AddString(result, answers[row].ToJson(questions[row]));
+			MutableData<string_t>(result)[row] = StringVector::AddString(result, answers[row].ToJson(questions[row]));
 		} else {
 			double threshold =
 			    args.ColumnCount() > 2 && bind.shape == Shape::IS ? args.GetValue(2, row).GetValue<double>() : 0.5;
@@ -230,21 +230,35 @@ void CheckConstants(ClientContext &context, Shape shape, vector<unique_ptr<Expre
 	}
 }
 
-template <Shape SHAPE>
-unique_ptr<FunctionData> Bind(ClientContext &context, ScalarFunction &function,
-                              vector<unique_ptr<Expression>> &arguments) {
-	function.arguments[0] = arguments[0]->return_type; // any input type; rows arrive as structs
+template <Shape SHAPE, class FUNCTION>
+unique_ptr<FunctionData> BindShape(ClientContext &context, FUNCTION &function,
+                                   vector<unique_ptr<Expression>> &arguments) {
+	Arguments(function)[0] = ExprType(*arguments[0]); // any input type; rows arrive as structs
 	auto mode = Settings::ReadOnStop(context);
 	function.SetReturnType(ReturnType(SHAPE, mode));
 	CheckConstants(context, SHAPE, arguments);
 	return make_uniq<TypedBindData>(SHAPE, mode);
 }
 
+#ifdef TYPED_AI_DUCKDB_V2
+template <Shape SHAPE>
+unique_ptr<FunctionData> Bind(BindScalarFunctionInput &input) {
+	return BindShape<SHAPE>(input.GetClientContext(), input.GetBoundFunction(), input.GetArguments());
+}
+#else
+template <Shape SHAPE>
+unique_ptr<FunctionData> Bind(ClientContext &context, ScalarFunction &function,
+                              vector<unique_ptr<Expression>> &arguments) {
+	return BindShape<SHAPE>(context, function, arguments);
+}
+#endif
+
 template <Shape SHAPE>
 ScalarFunction Make(const string &name, vector<LogicalType> arguments) {
 	// CONSISTENT (the default) and never VOLATILE: VOLATILE made ORDER BY .. LIMIT 10 judge every row.
-	ScalarFunction function(name, std::move(arguments), LogicalType::ANY, Execute, Bind<SHAPE>);
+	ScalarFunction function(Id(name), std::move(arguments), LogicalType::ANY, Execute, Bind<SHAPE>);
 	function.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	function.SetFallible(); // it raises errors on purpose (limits, bad keys); DuckDB 2.0 requires saying so
 	return function;
 }
 
@@ -255,9 +269,9 @@ struct UsageState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> UsageBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &types,
-                                   vector<string> &names) {
+                                   NameList &names) {
 	auto add = [&](const string &name, const LogicalType &type) {
-		names.push_back(name);
+		names.push_back(Id(name));
 		types.push_back(type);
 	};
 	add("profile", LogicalType::VARCHAR);
@@ -346,7 +360,7 @@ void RegisterFunctions(ExtensionLoader &loader) {
 	loader.RegisterFunction(Make<Shape::PICK>("typed_pick", {LogicalType::ANY, LogicalType::VARCHAR, list}));
 	loader.RegisterFunction(Make<Shape::SCORE>("typed_score", {LogicalType::ANY, LogicalType::VARCHAR, list}));
 	loader.RegisterFunction(Make<Shape::ASK>("typed_ask", {LogicalType::ANY, LogicalType::VARCHAR}));
-	loader.RegisterFunction(TableFunction("typed_usage", {}, UsageScan, UsageBind, UsageInit));
+	loader.RegisterFunction(TableFunction(Id("typed_usage"), {}, UsageScan, UsageBind, UsageInit));
 }
 
 } // namespace typed_ai

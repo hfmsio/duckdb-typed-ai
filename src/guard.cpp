@@ -1,4 +1,5 @@
 #include "typed_ai/guard.hpp"
+#include "typed_ai/compat.hpp"
 #include "typed_ai/profile.hpp"
 
 #include "duckdb/main/client_context.hpp"
@@ -11,13 +12,13 @@ namespace {
 
 Value GlobalSetting(ClientContext &context, const string &name) {
 	Value value;
-	DBConfig::GetConfig(context).TryGetCurrentSetting(name, value);
+	DBConfig::GetConfig(context).TryGetCurrentSetting(Id(name), value);
 	return value;
 }
 
 Value SessionSetting(ClientContext &context, const string &name) {
 	Value value;
-	context.TryGetCurrentSetting(name, value);
+	context.TryGetCurrentSetting(Id(name), value);
 	return value;
 }
 
@@ -219,12 +220,11 @@ idx_t DatabaseState::CacheEntries() {
 	return entries.size();
 }
 
-bool DatabaseState::Allow(const string &profile, uint64_t query_id, const std::atomic<bool> &interrupted,
-                          bool &is_probe) {
+bool DatabaseState::Allow(const string &profile, uint64_t query_id, ClientContext &context, bool &is_probe) {
 	is_probe = false;
 	unique_lock<mutex> guard(lock);
 	while (breakers[profile].probing) {
-		if (interrupted) {
+		if (context.IsInterrupted()) {
 			return false;
 		}
 		changed.wait_for(guard, std::chrono::milliseconds(100));
@@ -270,10 +270,10 @@ bool DatabaseState::BreakerOpen(const string &profile) {
 	return breakers[profile].open;
 }
 
-bool DatabaseState::AcquireSlot(int64_t limit, const std::atomic<bool> &interrupted) {
+bool DatabaseState::AcquireSlot(int64_t limit, ClientContext &context) {
 	unique_lock<mutex> guard(lock);
 	while (in_flight >= limit) {
-		if (interrupted) {
+		if (context.IsInterrupted()) {
 			return false;
 		}
 		changed.wait_for(guard, std::chrono::milliseconds(100));

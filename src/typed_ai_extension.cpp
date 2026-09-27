@@ -1,6 +1,7 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "typed_ai_extension.hpp"
+#include "typed_ai/compat.hpp"
 #include "typed_ai/functions.hpp"
 #include "typed_ai/profile.hpp"
 
@@ -21,11 +22,11 @@ static void CheckOnStop(ClientContext &, SetScope, Value &parameter) {
 static void LoadInternal(ExtensionLoader &loader) {
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
 	auto global = [&](const string &name, const string &description, const Value &value) {
-		config.AddExtensionOption(name, description, value.type(), value, nullptr, SetScope::GLOBAL);
+		config.AddExtensionOption(typed_ai::Id(name), description, value.type(), value, nullptr, SetScope::GLOBAL);
 	};
 	auto session = [&](const string &name, const string &description, const Value &value,
 	                   set_option_callback_t check = nullptr) {
-		config.AddExtensionOption(name, description, value.type(), value, check, SetScope::SESSION);
+		config.AddExtensionOption(typed_ai::Id(name), description, value.type(), value, check, SetScope::SESSION);
 	};
 
 	// Limits: one value for the whole database, so a new connection or cursor cannot raise them.

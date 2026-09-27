@@ -1,3 +1,4 @@
+#include "typed_ai/compat.hpp"
 #include "typed_ai/json.hpp"
 #include "typed_ai/types.hpp"
 
@@ -71,7 +72,7 @@ yyjson_mut_val *ValueToJson(JsonWriter &w, const Value &value) {
 		auto obj = yyjson_mut_obj(w.doc);
 		auto &children = StructValue::GetChildren(value);
 		for (idx_t i = 0; i < children.size(); i++) {
-			yyjson_mut_obj_add(obj, w.Str(StructType::GetChildName(type, i)), ValueToJson(w, children[i]));
+			yyjson_mut_obj_add(obj, w.Str(Str(StructType::GetChildName(type, i))), ValueToJson(w, children[i]));
 		}
 		return obj;
 	}

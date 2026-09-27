@@ -1,4 +1,5 @@
 #include "typed_ai/profile.hpp"
+#include "typed_ai/compat.hpp"
 
 #include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -12,12 +13,12 @@ namespace {
 const char *SECRET_TYPE = "typed_ai";
 
 string SecretString(const KeyValueSecret &secret, const string &key) {
-	auto value = secret.TryGetValue(key);
+	auto value = secret.TryGetValue(Id(key));
 	return value.IsNull() ? "" : value.ToString();
 }
 
 double SecretNumber(const KeyValueSecret &secret, const string &key) {
-	auto value = secret.TryGetValue(key);
+	auto value = secret.TryGetValue(Id(key));
 	return value.IsNull() ? -1 : value.GetValue<double>();
 }
 
@@ -57,7 +58,7 @@ unique_ptr<SecretEntry> FindSecret(ClientContext &context, const string &name) {
 	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
 	if (!name.empty()) {
 		auto entry = secrets.GetSecretByName(transaction, name);
-		if (!entry || entry->secret->GetType() != SECRET_TYPE) {
+		if (!entry || Str(entry->secret->GetType()) != SECRET_TYPE) {
 			throw InvalidInputException(
 			    "typed_ai: typed_profile is '%s', but there is no typed_ai secret with that name. "
 			    "Create it with CREATE SECRET %s (TYPE typed_ai, PROVIDER 'jev', API_KEY '...')",
@@ -67,14 +68,14 @@ unique_ptr<SecretEntry> FindSecret(ClientContext &context, const string &name) {
 	}
 	vector<SecretEntry> matches;
 	for (auto &entry : secrets.AllSecrets(transaction)) {
-		if (entry.secret->GetType() == SECRET_TYPE) {
+		if (Str(entry.secret->GetType()) == SECRET_TYPE) {
 			matches.push_back(entry);
 		}
 	}
 	if (matches.size() > 1) {
 		vector<string> names;
 		for (auto &entry : matches) {
-			names.push_back(entry.secret->GetName());
+			names.push_back(Str(entry.secret->GetName()));
 		}
 		throw InvalidInputException(
 		    "typed_ai: there are %d typed_ai secrets (%s); pick one with SET typed_profile = 'name'", matches.size(),
@@ -86,7 +87,7 @@ unique_ptr<SecretEntry> FindSecret(ClientContext &context, const string &name) {
 unique_ptr<BaseSecret> CreateSecret(ClientContext &, CreateSecretInput &input) {
 	auto secret = make_uniq<KeyValueSecret>(input.scope, input.type, input.provider, input.name);
 	for (auto &option : input.options) {
-		secret->secret_map[StringUtil::Lower(option.first)] = option.second;
+		secret->secret_map[Id(StringUtil::Lower(option.first))] = option.second;
 	}
 	secret->redact_keys = {"api_key"};
 	return std::move(secret);
@@ -109,8 +110,8 @@ Profile ResolveProfile(ClientContext &context, const string &name, unique_ptr<Pr
 	auto entry = FindSecret(context, name);
 	if (entry) {
 		auto &secret = dynamic_cast<const KeyValueSecret &>(*entry->secret);
-		profile.name = secret.GetName();
-		profile.provider = secret.GetProvider();
+		profile.name = Str(secret.GetName());
+		profile.provider = Str(secret.GetProvider());
 		profile.model = SecretString(secret, "model");
 		profile.url = SecretString(secret, "url");
 		profile.api_key = SecretString(secret, "api_key");
