@@ -11,8 +11,8 @@ extension:
 
 repo:
   github: hfmsio/duckdb-typed-ai
-  ref: 3a6958afd5e526dc82eff4fbfdc246dea07ccbcb
-  ref_next: 3a6958afd5e526dc82eff4fbfdc246dea07ccbcb
+  ref: 5568a85a1b3314b6cd84ae497e96ef32a392e048
+  ref_next: 5568a85a1b3314b6cd84ae497e96ef32a392e048
 
 docs:
   hello_world: |
