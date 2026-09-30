@@ -8,6 +8,13 @@ project(${TARGET_NAME})
 set(CMAKE_CXX_STANDARD "17" CACHE STRING "C++ standard to enforce")
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# DuckDB 2.0 changed several C++ APIs; src/include/typed_ai/compat.hpp switches on this. It keys on DuckDB's own
+# version number, because features such as identifier.hpp get backported to 1.5 patch releases.
+if(DUCKDB_MAJOR_VERSION GREATER_EQUAL 2)
+  add_definitions(-DTYPED_AI_DUCKDB_V2=1)
+endif()
+message(STATUS "typed_ai: building against DuckDB ${DUCKDB_MAJOR_VERSION}.${DUCKDB_MINOR_VERSION} APIs")
+
 # JSON comes from DuckDB's own copy of yyjson, compiled into this extension.
 include_directories(src/include ${DUCKDB_MODULE_BASE_DIR}/third_party/yyjson/include)
 

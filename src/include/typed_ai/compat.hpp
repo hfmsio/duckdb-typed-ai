@@ -6,12 +6,9 @@
 
 // One source for DuckDB 1.5 and 2.0. DuckDB 2.0 names things with Identifier where 1.5 used string, and hides
 // some fields behind accessors. These helpers cover the difference so the rest of the code reads the same.
-// identifier.hpp arrived in 2.0, so its presence tells the two apart.
-#if defined(__has_include)
-#if __has_include("duckdb/common/identifier.hpp")
+// TYPED_AI_DUCKDB_V2 comes from CMakeLists.txt, set from DuckDB's own major version.
+#ifdef TYPED_AI_DUCKDB_V2
 #include "duckdb/common/identifier.hpp"
-#define TYPED_AI_DUCKDB_V2 1
-#endif
 #endif
 
 namespace duckdb {
