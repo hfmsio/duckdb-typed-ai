@@ -16,7 +16,7 @@ statement ok
 CREATE SECRET m (TYPE typed_ai, PROVIDER 'jev', API_KEY 'k', URL '${TYPED_AI_MOCK}/jev/v1/systemone');
 
 statement ok
-CREATE TABLE t AS SELECT * FROM (VALUES (1, 'I want a refund now!!'), (2, 'how do I export to PDF'), (3, NULL)) v(id, body);
+CREATE TABLE t AS SELECT * FROM (VALUES (1, 'The lid is broken, very annoyed!!'), (2, 'Quick delivery, works as promised'), (3, NULL)) v(id, body);
 
 # ---- stop modes on a budget stop ----
 
@@ -94,22 +94,22 @@ RESET typed_on_stop;
 # ---- answers, Jev ----
 
 query IIIII
-SELECT id, typed_is(body, 'wants a refund'), typed_prob(body, 'wants a refund'),
-       typed_pick(body, 'which team?', ['billing', 'pdf', 'sales']), typed_score(body, 'anger', ['calm', 'annoyed', 'furious'])
+SELECT id, typed_is(body, 'reports a broken part'), typed_prob(body, 'reports a broken part'),
+       typed_pick(body, 'what is it about?', ['quality', 'delivery', 'price']), typed_score(body, 'annoyance', ['calm', 'irritated', 'angry'])
 FROM t ORDER BY id;
 ----
-1	true	0.9	billing	2.0
-2	false	0.1	pdf	0.0
+1	true	0.9	quality	2.0
+2	false	0.1	delivery	0.0
 3	NULL	NULL	NULL	NULL
 
 query I
-SELECT typed_ask(body, '{"v": 1, "type": "pick", "question": "team?", "options": ["billing", "pdf"]}') FROM t WHERE id = 2;
+SELECT typed_ask(body, '{"v": 1, "type": "pick", "question": "topic?", "options": ["quality", "delivery"]}') FROM t WHERE id = 2;
 ----
-{"type":"pick","choice":"pdf","probabilities":{"billing":0.2,"pdf":0.8},"confidence":0.7,"model":"jev-mock-1.0","calibrated":true,"error":null}
+{"type":"pick","choice":"delivery","probabilities":{"quality":0.2,"delivery":0.8},"confidence":0.7,"model":"jev-mock-1.0","calibrated":true,"error":null}
 
 # A whole row goes in as JSON
 query I
-SELECT typed_prob(t, 'wants a refund') FROM t WHERE id = 1;
+SELECT typed_prob(t, 'reports a broken part') FROM t WHERE id = 1;
 ----
 0.9
 
@@ -119,7 +119,7 @@ statement ok
 SELECT content FROM read_text('${TYPED_AI_MOCK}/reset');
 
 query I
-SELECT count(typed_prob(body, 'wants a refund')) FROM t;
+SELECT count(typed_prob(body, 'reports a broken part')) FROM t;
 ----
 2
 
@@ -138,15 +138,15 @@ statement ok
 SET typed_profile = 'o';
 
 query IIII
-SELECT id, round(typed_prob(body, 'wants a refund'), 3), typed_pick(body, 'which team?', ['billing', 'pdf', 'sales']),
-       round(typed_score(body, 'anger', ['calm', 'annoyed', 'furious']), 3)
+SELECT id, round(typed_prob(body, 'reports a broken part'), 3), typed_pick(body, 'what is it about?', ['quality', 'delivery', 'price']),
+       round(typed_score(body, 'annoyance', ['calm', 'irritated', 'angry']), 3)
 FROM t WHERE id < 3 ORDER BY id;
 ----
-1	0.9	billing	2.0
-2	0.1	pdf	0.0
+1	0.9	quality	2.0
+2	0.1	delivery	0.0
 
 query I
-SELECT typed_ask(body, '{"v": 1, "type": "yes_no", "question": "refund?"}') FROM t WHERE id = 1;
+SELECT typed_ask(body, '{"v": 1, "type": "yes_no", "question": "broken part?"}') FROM t WHERE id = 1;
 ----
 {"type":"yes_no","probability":0.9,"model":"mock-small","calibrated":false,"error":null}
 

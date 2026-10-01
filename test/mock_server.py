@@ -6,7 +6,7 @@ Paths:  /jev/v1/systemone              answers like Jev
         /<fault>/...                   fails first: fail500, fail429, fail401, fail400, garbage, nologprobs, slow (2 s)
         /count  /reset                 requests seen since the last reset
 
-Answers follow simple rules so tests can predict them: yes/no is 0.9 when the text says "refund", else 0.1;
+Answers follow simple rules so tests can predict them: yes/no is 0.9 when the text says "broken", else 0.1;
 pick chooses the first option named in the text, else the first option; score is the number of "!" (capped).
 
 Run: python3 test/mock_server.py [port]   (default 8765)
@@ -26,7 +26,7 @@ count = 0
 def judge(text, kind, options):
     text = text.lower()
     if kind == "yes_no":
-        return {"yes": 0.9 if "refund" in text else 0.1}
+        return {"yes": 0.9 if "broken" in text else 0.1}
     if kind == "pick":
         chosen = next((o for o in options if o.lower() in text), options[0])
         return {o: (0.8 if o == chosen else 0.2 / max(len(options) - 1, 1)) for o in options}

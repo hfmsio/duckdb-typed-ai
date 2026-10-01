@@ -15,28 +15,28 @@ SET typed_budget_usd = 0.001;
 
 statement ok
 CREATE TABLE t AS SELECT * FROM (VALUES
-    (1, 'card declined again, I want my money back'),
-    (2, 'how do I export a dashboard to PDF?')) v(id, body);
+    (1, 'The blender lid cracked the first time I washed it.'),
+    (2, 'The parcel arrived three days late and the box was soaked.')) v(id, body);
 
 query II
-SELECT id, typed_is(body, 'the customer wants a refund') FROM t ORDER BY id;
+SELECT id, typed_is(body, 'the reviewer reports a broken part') FROM t ORDER BY id;
 ----
 1	true
 2	false
 
 query II
-SELECT id, typed_pick(body, 'which team should handle this?', ['billing', 'technical', 'sales']) FROM t ORDER BY id;
+SELECT id, typed_pick(body, 'what is this review mainly about?', ['product quality', 'shipping', 'price']) FROM t ORDER BY id;
 ----
-1	billing
-2	technical
+1	product quality
+2	shipping
 
 query I
-SELECT typed_score(body, 'how angry is the customer?', ['calm', 'annoyed', 'furious']) BETWEEN 0 AND 2 FROM t WHERE id = 1;
+SELECT typed_score(body, 'how satisfied is the reviewer?', ['very unhappy', 'unhappy', 'neutral', 'happy', 'very happy']) BETWEEN 0 AND 4 FROM t WHERE id = 1;
 ----
 true
 
 query I
-SELECT typed_ask(body, '{"v": 1, "type": "yes_no", "question": "wants a refund"}')::VARCHAR LIKE '%"model":"jev-%"calibrated":true%'
+SELECT typed_ask(body, '{"v": 1, "type": "yes_no", "question": "reports a broken part"}')::VARCHAR LIKE '%"model":"jev-%"calibrated":true%'
 FROM t WHERE id = 1;
 ----
 true

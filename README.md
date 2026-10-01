@@ -24,8 +24,8 @@ Two providers ship: [TypeSafe Jev](https://docs.typesafe.ai) and any OpenAI-comp
 LOAD typed_ai;
 CREATE SECRET jev (TYPE typed_ai, PROVIDER 'jev', API_KEY 'ts_...');
 
-SELECT * FROM tickets t WHERE typed_is(t.body, 'the customer wants a refund');
-SELECT body, typed_pick(body, 'which team should handle this?', ['billing', 'technical', 'sales']) FROM tickets;
+SELECT * FROM bot_answers b WHERE NOT typed_is(b, 'the answer is fully supported by the source');
+SELECT question, typed_pick(question, 'what is the visitor asking about?', (SELECT list(name) FROM topics)) FROM bot_answers;
 FROM typed_usage();
 ```
 
@@ -33,202 +33,231 @@ With no secret, the built-in `jev` profile reads `TYPESAFE_API_KEY` from the env
 
 ## Walkthrough for a first session
 
-A first session from start to finish on DuckDB v1.5.5. The outputs come from real runs, except step 7, which shows
-example numbers. Probabilities can differ a little between runs and model versions.
+A museum runs a chatbot that answers visitors' questions from the exhibit texts. This session audits it: which
+answers the source does not support, how sure we can be, what each question is about, and whether a free local
+model would have caught the same mistakes. Outputs are from a real run on DuckDB v1.5.6 with Jev (it cost
+$0.00007) and Ollama with `gemma2:2b`. Probabilities can differ a little between runs and model versions.
 
 ### 1. Start DuckDB and load the extension
 
-A local build is not signed by DuckDB, so start the CLI with `-unsigned`. The API key comes from
-`TYPESAFE_API_KEY` in your environment (for example `export TYPESAFE_API_KEY=...` in `~/.zshrc`), so nothing else
-is needed.
+A local build is not signed by DuckDB, so start the CLI with `-unsigned`. The key comes from `TYPESAFE_API_KEY`.
 
 ```text
 $ duckdb -unsigned
-D LOAD '/path/to/duckdb-jev-ext/build/release/extension/typed_ai/typed_ai.duckdb_extension';
+D LOAD '/path/to/duckdb-typed-ai/build/release/extension/typed_ai/typed_ai.duckdb_extension';
+D CREATE SECRET jev (TYPE typed_ai, PROVIDER 'jev', API_KEY getenv('TYPESAFE_API_KEY'));
 ```
 
-### 2. Make a small table
+**No API key yet?** Every step also runs free on your laptop with [Ollama](https://ollama.com). Run
+`ollama pull gemma2:2b`, then use this secret instead of the Jev one:
 
 ```sql
-CREATE TABLE tickets AS SELECT * FROM (VALUES
-  ('card declined again, I want my money back'),
-  ('how do I export a dashboard to PDF?')) t(body);
+CREATE SECRET local (TYPE typed_ai, PROVIDER 'openai', MODEL 'gemma2:2b',
+  URL 'http://localhost:11434/v1/chat/completions', USD_PER_MTOK_IN 0, USD_PER_MTOK_OUT 0);
 ```
 
-### 3. Keep the rows where the answer is yes
+Expect weaker answers. In step 3 the local model flags only one of the three mistakes, where Jev flags all three:
 
-`typed_is` returns true or false, so it works in `WHERE`.
+```text
+┌───────┬─────────────────────────────────────┐
+│  id   │               answer                │
+│ int32 │               varchar               │
+├───────┼─────────────────────────────────────┤
+│     6 │ It is around 150 million years old. │
+└───────┴─────────────────────────────────────┘
+```
+
+The local model is good for trying the extension and for a free first pass (step 6); Jev is the one to trust for
+the final call, because its odds are calibrated.
+
+### 2. Load what the bot said
+
+Each row holds the visitor's question, the exhibit text the bot should rely on, and the bot's answer. A second
+table lists the topics the museum tracks.
 
 ```sql
-SELECT * FROM tickets WHERE typed_is(body, 'the customer wants a refund');
+CREATE TABLE bot_answers AS SELECT * FROM (VALUES
+  (1, 'When was the observatory built?', 'The observatory opened in 1891 and was rebuilt after a fire in 1932.', 'It was built in 1891.'),
+  (2, 'Who painted the ceiling?', 'The ceiling mural was painted by Ilse Marten between 1904 and 1906.', 'Ilse Marten painted it in 1910.'),
+  (3, 'Can I take photos?', 'Photography without flash is allowed in all galleries.', 'Yes, flash photography is fine everywhere.'),
+  (4, 'How heavy is the meteorite?', 'The Ashford meteorite weighs 412 kilograms.', 'It weighs about 412 kg.'),
+  (5, 'Is the cafe open on Mondays?', 'The cafe is open Tuesday to Sunday.', 'No, the cafe is closed on Mondays.'),
+  (6, 'How old is the dinosaur skeleton?', 'The skeleton is about 68 million years old.', 'It is around 150 million years old.')
+) t(id, question, source, answer);
+
+CREATE TABLE topics AS SELECT * FROM (VALUES ('history'), ('art'), ('visiting rules'), ('science'), ('food and drink')) t(name);
+```
+
+### 3. Find the answers the source does not support
+
+Passing the whole row (`b`) sends all three columns as one JSON object, so the model compares the answer with
+its source.
+
+```sql
+SELECT id, answer FROM bot_answers b WHERE NOT typed_is(b, 'the answer is fully supported by the source');
 ```
 
 ```text
-┌───────────────────────────────────────────┐
-│                   body                    │
-│                  varchar                  │
-├───────────────────────────────────────────┤
-│ card declined again, I want my money back │
-└───────────────────────────────────────────┘
+┌───────┬────────────────────────────────────────────┐
+│  id   │                   answer                   │
+│ int32 │                  varchar                   │
+├───────┼────────────────────────────────────────────┤
+│     2 │ Ilse Marten painted it in 1910.            │
+│     3 │ Yes, flash photography is fine everywhere. │
+│     6 │ It is around 150 million years old.        │
+└───────┴────────────────────────────────────────────┘
 ```
 
-### 4. See how sure the model is
+Rows 1, 4 and 5 are missing because their answers match the source; `NOT` keeps only the mistakes. Row 2 gets
+the year wrong, row 3 the flash rule, row 6 the age.
 
-`typed_prob` returns the probability of yes, from 0 to 1. Look at these before picking a threshold for `typed_is`
-(the default is 0.5).
+### 4. Look at the odds before trusting a cut-off
+
+`typed_is` cuts at 0.5 by default. The probabilities behind it show how clean the split is:
 
 ```sql
-SELECT body, typed_prob(body, 'the customer wants a refund') AS refund_chance FROM tickets;
+SELECT round(typed_prob(b, 'the answer is fully supported by the source'), 1) AS bucket, count(*) AS answers
+FROM bot_answers b GROUP BY bucket ORDER BY bucket;
 ```
 
 ```text
-┌───────────────────────────────────────────┬───────────────┐
-│                   body                    │ refund_chance │
-│                  varchar                  │    double     │
-├───────────────────────────────────────────┼───────────────┤
-│ card declined again, I want my money back │          0.96 │
-│ how do I export a dashboard to PDF?       │          0.03 │
-└───────────────────────────────────────────┴───────────────┘
+┌────────┬─────────┐
+│ bucket │ answers │
+│ double │  int64  │
+├────────┼─────────┤
+│    0.0 │       3 │
+│    0.8 │       1 │
+│    0.9 │       1 │
+│    1.0 │       1 │
+└────────┴─────────┘
 ```
 
-### 5. Pick one option
+Nothing sits in the middle, so any cut-off between 0.1 and 0.8 gives the same result. On real data, pick the
+cut-off where the buckets thin out and pass it as the third argument: `typed_is(b, '...', 0.7)`.
 
-`typed_pick` returns one of the options, exactly as written.
+### 5. Take the options from a table
+
+The topic list comes from `topics`, so adding a topic is an `INSERT`, not a query change.
 
 ```sql
-SELECT body, typed_pick(body, 'which team should handle this?', ['billing', 'technical', 'sales']) AS team
-FROM tickets;
+SELECT id, question, typed_pick(question, 'what is the visitor asking about?', (SELECT list(name) FROM topics)) AS topic
+FROM bot_answers;
 ```
 
 ```text
-┌───────────────────────────────────────────┬───────────┐
-│                   body                    │   team    │
-│                  varchar                  │  varchar  │
-├───────────────────────────────────────────┼───────────┤
-│ card declined again, I want my money back │ billing   │
-│ how do I export a dashboard to PDF?       │ technical │
-└───────────────────────────────────────────┴───────────┘
+┌───────┬───────────────────────────────────┬────────────────┐
+│  id   │             question              │     topic      │
+│ int32 │              varchar              │    varchar     │
+├───────┼───────────────────────────────────┼────────────────┤
+│     1 │ When was the observatory built?   │ history        │
+│     2 │ Who painted the ceiling?          │ art            │
+│     3 │ Can I take photos?                │ visiting rules │
+│     4 │ How heavy is the meteorite?       │ science        │
+│     5 │ Is the cafe open on Mondays?      │ food and drink │
+│     6 │ How old is the dinosaur skeleton? │ science        │
+└───────┴───────────────────────────────────┴────────────────┘
 ```
 
-### 6. Score on a scale
-
-`typed_score` returns a position on the levels you list, lowest first: here 0 is calm and 2 is furious. The score
-can land between levels.
+Now the topics earn their place: which ones does the bot get wrong most?
 
 ```sql
-SELECT body, typed_score(body, 'how angry is the customer?', ['calm', 'annoyed', 'furious']) AS anger
-FROM tickets;
+SELECT typed_pick(question, 'what is the visitor asking about?', (SELECT list(name) FROM topics)) AS topic,
+       count(*) AS asked,
+       count(*) FILTER (WHERE NOT typed_is(b, 'the answer is fully supported by the source')) AS wrong
+FROM bot_answers b GROUP BY topic ORDER BY wrong DESC, topic;
 ```
 
 ```text
-┌───────────────────────────────────────────┬────────┐
-│                   body                    │ anger  │
-│                  varchar                  │ double │
-├───────────────────────────────────────────┼────────┤
-│ card declined again, I want my money back │    1.3 │
-│ how do I export a dashboard to PDF?       │    0.0 │
-└───────────────────────────────────────────┴────────┘
+┌────────────────┬───────┬───────┐
+│     topic      │ asked │ wrong │
+│    varchar     │ int64 │ int64 │
+├────────────────┼───────┼───────┤
+│ art            │     1 │     1 │
+│ science        │     2 │     1 │
+│ visiting rules │     1 │     1 │
+│ food and drink │     1 │     0 │
+│ history        │     1 │     0 │
+└────────────────┴───────┴───────┘
 ```
+
+Every judgment here was already made in steps 3 and 5, so this query is answered from memory and costs nothing.
+
+### 6. Compare with a free local model
+
+Save Jev's answers, switch the profile to a local model, ask again, and let SQL find the disagreements.
+
+```sql
+CREATE TABLE by_jev AS SELECT id, typed_prob(b, 'the answer is fully supported by the source') AS p FROM bot_answers b;
+
+CREATE SECRET local (TYPE typed_ai, PROVIDER 'openai', MODEL 'gemma2:2b',
+  URL 'http://localhost:11434/v1/chat/completions', USD_PER_MTOK_IN 0, USD_PER_MTOK_OUT 0);
+SET typed_profile = 'local';
+CREATE TABLE by_local AS SELECT id, typed_prob(b, 'the answer is fully supported by the source') AS p FROM bot_answers b;
+
+SELECT j.id, round(j.p, 2) AS jev, round(l.p, 2) AS local_model, abs(j.p - l.p) > 0.5 AS disagree
+FROM by_jev j JOIN by_local l USING (id) ORDER BY id;
+```
+
+```text
+┌───────┬────────┬─────────────┬──────────┐
+│  id   │  jev   │ local_model │ disagree │
+│ int32 │ double │   double    │ boolean  │
+├───────┼────────┼─────────────┼──────────┤
+│     1 │   0.84 │         1.0 │ false    │
+│     2 │   0.01 │        0.99 │ true     │
+│     3 │   0.02 │         1.0 │ true     │
+│     4 │   0.97 │         1.0 │ false    │
+│     5 │   0.94 │         1.0 │ false    │
+│     6 │   0.01 │         0.0 │ false    │
+└───────┴────────┴─────────────┴──────────┘
+```
+
+The small local model missed the wrong year (row 2) and the flash rule (row 3). It costs nothing, so it suits a
+first pass; Jev's odds are calibrated, so they suit the final call.
 
 ### 7. Check what you have spent
 
-`typed_usage()` has 19 columns; pick the ones you want to read.
-
 ```sql
-SELECT profile, model, requests, printf('$%.6f', spent_usd) AS spent, budget_usd FROM typed_usage();
+SET typed_profile = 'jev';
+SELECT profile, requests, printf('$%.6f', spent_usd) AS spent FROM typed_usage();
 ```
 
 ```text
-┌────────────────┬────────────┬──────────┬───────────┬────────────┐
-│    profile     │   model    │ requests │   spent   │ budget_usd │
-│    varchar     │  varchar   │  int64   │  varchar  │   double   │
-├────────────────┼────────────┼──────────┼───────────┼────────────┤
-│ jev (built in) │ jev-latest │        3 │ $0.000060 │        1.0 │
-└────────────────┴────────────┴──────────┴───────────┴────────────┘
+┌─────────┬──────────┬───────────┐
+│ profile │ requests │   spent   │
+│ varchar │  int64   │  varchar  │
+├─────────┼──────────┼───────────┤
+│ jev     │        8 │ $0.000067 │
+└─────────┴──────────┴───────────┘
 ```
-
-Example numbers: steps 3 to 6 take about 3 requests, because rows are sent 10 to a request and `typed_is` and
-`typed_prob` share one saved answer when they ask the same question.
 
 Asking the same question about the same row again is free: answers are saved in memory.
 
 ### 8. Price a big table before running it
 
-With more than 1,000 rows the query is refused before anything is sent:
+With more than 1,000 rows the query is refused before anything is sent. A dry run prices it without calling
+anything:
 
 ```sql
-CREATE TABLE big_table AS SELECT 'support ticket number ' || i AS body FROM range(5000) r(i);
-SELECT typed_prob(body, 'the customer wants a refund') FROM big_table;
-```
-
-```text
-Invalid Input Error: typed_ai: this query would send more than 1000 rows to the model (typed_max_rows).
-To allow more: SET typed_max_rows = N. ...
-```
-
-A dry run prices it without calling anything:
-
-```sql
+CREATE TABLE all_answers AS SELECT 'answer number ' || i AS answer FROM range(5000) r(i);
 SET typed_dry_run = true;
 SET typed_max_rows = 5000;
-SELECT count(typed_prob(body, 'the customer wants a refund')) FROM big_table;
-SELECT printf('$%.4f', dry_run_usd) AS would_cost, requests AS calls_made FROM typed_usage();
+SELECT count(typed_prob(answer, 'the answer mentions a date')) FROM all_answers;
+SELECT printf('$%.4f', dry_run_usd) AS would_cost FROM typed_usage();
 SET typed_dry_run = false;
 ```
 
 ```text
-┌────────────┬────────────┐
-│ would_cost │ calls_made │
-│  varchar   │   int64    │
-├────────────┼────────────┤
-│ $0.0092    │          0 │
-└────────────┴────────────┘
+┌────────────┐
+│ would_cost │
+│  varchar   │
+├────────────┤
+│ $0.0088    │
+└────────────┘
 ```
 
-If the price is fine, run the same query with `typed_dry_run` off. The budget (`typed_budget_usd`, default $1)
-still stops it if the estimate was low.
-
-### 9. Use a free local model instead
-
-With [Ollama](https://ollama.com) running and a model pulled (`ollama pull gemma2:2b`), a profile points the same
-functions at it. Nothing is billed.
-
-```sql
-CREATE SECRET local (TYPE typed_ai, PROVIDER 'openai', MODEL 'gemma2:2b',
-  URL 'http://localhost:11434/v1/chat/completions', USD_PER_MTOK_IN 0, USD_PER_MTOK_OUT 0);
-SET typed_profile = 'local';
-SELECT body, typed_pick(body, 'which team should handle this?', ['billing', 'technical', 'sales']) AS team
-FROM tickets;
-```
-
-```text
-┌───────────────────────────────────────────┬───────────┐
-│                   body                    │   team    │
-│                  varchar                  │  varchar  │
-├───────────────────────────────────────────┼───────────┤
-│ card declined again, I want my money back │ billing   │
-│ how do I export a dashboard to PDF?       │ technical │
-└───────────────────────────────────────────┴───────────┘
-```
-
-To go back to Jev: `RESET typed_profile;` and `DROP SECRET local;`. With two secrets and no `typed_profile`, the
-first call asks you to pick one.
-
-### 10. See the full answer
-
-`typed_ask` returns everything the model said, as JSON: the choice, the probability of each option, the model
-version, and whether its odds are calibrated (Jev's are; a local model's are not).
-
-```sql
-SELECT typed_ask(body, '{"v": 1, "type": "pick", "question": "which team?", "options": ["billing", "technical"]}')
-FROM tickets LIMIT 1;
-```
-
-```text
-{"type":"pick","choice":"billing","probabilities":{"billing":0.9928,"technical":0.0072},"model":"gemma2:2b","calibrated":false,"error":null}
-```
-
-(Probabilities shortened here; the real output has full precision.)
+If the price is fine, run it with `typed_dry_run` off. The budget (`typed_budget_usd`, default $1) still stops it
+if the estimate was low.
 
 ## Safety first
 
@@ -243,12 +272,12 @@ FROM tickets LIMIT 1;
 | --- | --- |
 | `typed_is(input, statement [, threshold])` | `BOOLEAN`: probability of yes at or above the threshold (default 0.5) |
 | `typed_prob(input, statement)` | `DOUBLE`: probability of yes, 0 to 1 |
-| `typed_pick(input, question, options)` | `VARCHAR`: the most likely option, exactly as given |
+| `typed_pick(input, question, options)` | `VARCHAR`: the option the model rates highest; options can come from a table |
 | `typed_score(input, question, levels)` | `DOUBLE`: probability-weighted level, 0 to n-1 |
 | `typed_ask(input, question_json)` | `JSON`: the full answer with probabilities, confidence, model and whether it is calibrated |
 | `typed_usage()` | one row: spend, budget, requests, retries, cache, breaker, and the last query's counts |
 
-`input` can be any value. Text is sent as it is; a struct or a whole row (`t` in `FROM tickets t`) is sent as
+`input` can be any value. Text is sent as it is; a struct or a whole row (`b` in `FROM bot_answers b`) is sent as
 JSON, so column names reach the model. Send only the columns the question needs: it costs less and reads better.
 
 A `NULL` argument gives a `NULL` answer and makes no call.
@@ -256,9 +285,9 @@ A `NULL` argument gives a `NULL` answer and makes no call.
 `typed_ask` takes one question in typed_ai's own JSON, which every provider reads:
 
 ```sql
-SELECT typed_ask(body, '{"v": 1, "type": "pick", "question": "Which team?",
-                         "options": ["billing", "technical"],
-                         "criteria": {"billing": "payments, refunds, invoices"}}') FROM tickets;
+SELECT typed_ask(answer, '{"v": 1, "type": "pick", "question": "what kind of mistake is this?",
+                           "options": ["wrong fact", "wrong rule", "no mistake"],
+                           "criteria": {"wrong rule": "misstates what visitors may do"}}') FROM bot_answers;
 ```
 
 `type` is `yes_no`, `pick` (with `options`) or `score` (with `levels`, lowest first). The result is `JSON`; without
@@ -288,7 +317,7 @@ DuckDB's `json` extension loaded, cast it with `::VARCHAR` before comparing it a
   because DuckDB works in blocks. Limit before judging instead:
 
 ```sql
-FROM (SELECT * FROM tickets LIMIT 10) t WHERE typed_is(t.body, 'wants a refund');
+FROM (SELECT * FROM bot_answers LIMIT 10) b WHERE typed_is(b, 'the answer is fully supported by the source');
 ```
 
 ## When a job stops partway
@@ -320,7 +349,7 @@ In `'row'` mode `typed_prob`, `typed_pick` and `typed_score` return `STRUCT(valu
 - The cache lives as long as the process. For a job that must survive a crash, write results in steps:
 
 ```sql
-INSERT INTO results SELECT id, typed_prob(body, 'wants a refund') FROM tickets WHERE id BETWEEN 1 AND 100000;
+INSERT INTO results SELECT id, typed_prob(b, 'the answer is fully supported by the source') FROM bot_answers b WHERE id BETWEEN 1 AND 100000;
 ```
 
 ## Profiles
