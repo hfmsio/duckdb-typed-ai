@@ -21,6 +21,7 @@ Two providers ship: [TypeSafe Jev](https://docs.typesafe.ai) and any OpenAI-comp
 ## Quick start
 
 ```sql
+INSTALL typed_ai FROM community;
 LOAD typed_ai;
 CREATE SECRET jev (TYPE typed_ai, PROVIDER 'jev', API_KEY 'ts_...');
 
@@ -40,11 +41,12 @@ $0.00007) and Ollama with `gemma2:2b`. Probabilities can differ a little between
 
 ### 1. Start DuckDB and load the extension
 
-A local build is not signed by DuckDB, so start the CLI with `-unsigned`. The key comes from `TYPESAFE_API_KEY`.
+The extension comes from DuckDB's community store. The key comes from `TYPESAFE_API_KEY`.
 
 ```text
-$ duckdb -unsigned
-D LOAD '/path/to/duckdb-typed-ai/build/release/extension/typed_ai/typed_ai.duckdb_extension';
+$ duckdb
+D INSTALL typed_ai FROM community;
+D LOAD typed_ai;
 D CREATE SECRET jev (TYPE typed_ai, PROVIDER 'jev', API_KEY getenv('TYPESAFE_API_KEY'));
 ```
 
