@@ -4,7 +4,7 @@ A DuckDB extension that asks a model typed questions about rows: yes/no, pick on
 probabilities from the model's own odds, and spending is capped from the first query.
 
 Two providers ship: [TypeSafe Jev](https://docs.typesafe.ai) and any OpenAI-compatible server that returns
-`logprobs` (OpenAI, vLLM, llama.cpp, Ollama, OpenRouter).
+`logprobs`, such as OpenAI or a local Ollama.
 
 ## Contents
 
@@ -25,8 +25,12 @@ INSTALL typed_ai FROM community;
 LOAD typed_ai;
 CREATE SECRET jev (TYPE typed_ai, PROVIDER 'jev', API_KEY 'ts_...');
 
-SELECT * FROM bot_answers b WHERE NOT typed_is(b, 'the answer is fully supported by the source');
-SELECT question, typed_pick(question, 'what is the visitor asking about?', (SELECT list(name) FROM topics)) FROM bot_answers;
+CREATE TABLE found AS FROM (VALUES ('insulin pen', 'waiting room'), ('half-eaten sandwich', 'train to Leeds'))
+  t(item, place);
+
+SELECT item, typed_prob(item, 'the owner needs this back today') AS urgent FROM found;
+SELECT item, typed_pick(item, 'which shelf?', ['medical', 'throw away', 'general']) AS shelf FROM found;
+SELECT item FROM found f WHERE typed_is(f, 'it was left on a train');
 FROM typed_usage();
 ```
 
