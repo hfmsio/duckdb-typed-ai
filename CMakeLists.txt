@@ -25,8 +25,10 @@ if(TYPED_AI_DUCKDB_V2)
 endif()
 message(STATUS "typed_ai: DuckDB version '${DUCKDB_MAJOR_VERSION}', 2.0 APIs: ${TYPED_AI_DUCKDB_V2}")
 
-# JSON comes from DuckDB's own copy of yyjson, compiled into this extension.
+# JSON comes from DuckDB's own copy of yyjson, compiled into this extension under our own namespace, so it never
+# clashes with a DuckDB build that links its copy too (DuckDB 2.0's prebuilt library does).
 include_directories(src/include ${DUCKDB_MODULE_BASE_DIR}/third_party/yyjson/include)
+add_definitions(-Dduckdb_yyjson=typed_ai_yyjson)
 
 set(EXTENSION_SOURCES
     src/typed_ai_extension.cpp
