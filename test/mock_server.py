@@ -31,7 +31,9 @@ photos = 0
 def judge(text, kind, options, pictures=None):
     pictures = pictures or {}
     if kind == "pick":
-        chosen = next((o for o in options if o.lower() in text.lower() or (pictures.get(o) or "\0") in text), options[0])
+        chosen = next(
+            (o for o in options if o.lower() in text.lower() or (pictures.get(o) or "\0") in text), options[0]
+        )
     text = text.lower()
     if kind == "yes_no":
         return {"yes": 0.9 if "broken" in text else 0.1}
@@ -131,7 +133,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_HEAD(self):
         # read_text() asks for the size first. HEAD on /reset must not reset, so it reports "ok".
         with lock:
-            size = 2 if self.path.startswith("/reset") else len(str(photos if self.path.startswith("/photos") else count))
+            size = (
+                2 if self.path.startswith("/reset") else len(str(photos if self.path.startswith("/photos") else count))
+            )
         self.send_response(200)
         self.send_header("Content-Length", str(size))
         self.end_headers()
