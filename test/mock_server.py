@@ -7,11 +7,15 @@ Paths:  /jev/v1/systemone              answers like Jev
         /count  /reset                 requests seen since the last reset
 
 Answers follow simple rules so tests can predict them: yes/no is 0.9 when the text says "broken", else 0.1;
-pick chooses the first option named in the text, else the first option; score is the number of "!" (capped).
+pick chooses the first option named in the text, or whose picture is in the text, else the first option; score is
+the number of "!" (capped); a box is always left 0.25, top 0.1, right 0.75, bottom 0.9.
+A photo is judged on its file bytes, so a test photo can carry the word in its header. Photos need Jev's preview
+header and every asset must be used, as Jev requires; /photos counts the photos seen.
 
 Run: python3 test/mock_server.py [port]   (default 8765)
 """
 
+import base64
 import json
 import math
 import sys
@@ -21,21 +25,36 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 lock = threading.Lock()
 count = 0
+photos = 0
 
 
-def judge(text, kind, options):
+def judge(text, kind, options, pictures=None):
+    pictures = pictures or {}
+    if kind == "pick":
+        chosen = next((o for o in options if o.lower() in text.lower() or (pictures.get(o) or "\0") in text), options[0])
     text = text.lower()
     if kind == "yes_no":
         return {"yes": 0.9 if "broken" in text else 0.1}
     if kind == "pick":
-        chosen = next((o for o in options if o.lower() in text), options[0])
         return {o: (0.8 if o == chosen else 0.2 / max(len(options) - 1, 1)) for o in options}
     level = min(text.count("!"), len(options) - 1)
     return {str(i): (1.0 if i == level else 0.0) for i in range(len(options))}
 
 
+def swap_photos(value, assets):
+    """Replaces each photo reference with the photo's bytes as text, as Jev replaces it with the image."""
+    if isinstance(value, dict):
+        return {k: swap_photos(v, assets) for k, v in value.items()}
+    if isinstance(value, list):
+        return [swap_photos(v, assets) for v in value]
+    if isinstance(value, str) and value in assets:
+        return base64.b64decode(assets[value]["data_base64"], validate=True).decode("latin-1")
+    return value
+
+
 def jev_answer(body):
-    state, answers = body["state"], {}
+    assets, answers = body.get("assets", {}), {}
+    state = swap_photos(body["state"], assets)
     for qid, q in body["questions"].items():
         instructions = q["instructions"]
         # Judge the row only, never the question, so answers depend on the data.
@@ -44,8 +63,13 @@ def jev_answer(body):
         )
         if q["type"] == "noul":
             answers[qid] = {"type": "noul", "noul": judge(text, "yes_no", [])["yes"]}
+        elif q["type"] == "box":
+            box = {"left": 0.25, "top": 0.1, "right": 0.75, "bottom": 0.9}
+            answers[qid] = {"type": "box", "box": box, "confidence": 0.8}
         elif q["type"] == "choice":
-            probs = judge(text, "pick", list(q["criteria"].keys()))
+            # Pictures written the way the judged text writes them, so a photo matches itself.
+            pictures = {k: json.dumps(v)[1:-1] for k, v in swap_photos(q["criteria"], assets).items() if v}
+            probs = judge(text, "pick", list(q["criteria"].keys()), pictures)
             answers[qid] = {
                 "type": "choice",
                 "choice": max(probs, key=probs.get),
@@ -94,12 +118,12 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def get_body(self):
-        global count
+        global count, photos
         with lock:
             if self.path.startswith("/reset"):
-                count = 0
+                count = photos = 0
                 return b"ok"
-            return str(count).encode()
+            return str(photos if self.path.startswith("/photos") else count).encode()
 
     def do_GET(self):
         self.reply(200, self.get_body())
@@ -107,13 +131,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_HEAD(self):
         # read_text() asks for the size first. HEAD on /reset must not reset, so it reports "ok".
         with lock:
-            size = 2 if self.path.startswith("/reset") else len(str(count))
+            size = 2 if self.path.startswith("/reset") else len(str(photos if self.path.startswith("/photos") else count))
         self.send_response(200)
         self.send_header("Content-Length", str(size))
         self.end_headers()
 
     def do_POST(self):
-        global count
+        global count, photos
         with lock:
             count += 1
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
@@ -130,6 +154,15 @@ class Handler(BaseHTTPRequestHandler):
             time.sleep(2)
         if fault == "garbage":
             return self.reply(200, b"not json")
+        assets = body.get("assets", {})
+        if assets:
+            if self.headers.get("TypeSafe-Danger-Zone-Images") != "true":
+                return self.reply(400, {"error": "images are not turned on"})
+            used = json.dumps([body["state"], body["questions"]])
+            if any(ref not in used for ref in assets):
+                return self.reply(400, {"error": "an asset is not referenced"})
+            with lock:
+                photos += len(assets)
         if "chat/completions" in self.path:
             return self.reply(200, openai_answer(body, with_logprobs=fault != "nologprobs"))
         return self.reply(200, jev_answer(body))

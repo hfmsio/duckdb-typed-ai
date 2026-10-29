@@ -46,11 +46,16 @@ string JsonWriter::Write(yyjson_mut_val *root) {
 	return result;
 }
 
-yyjson_mut_val *ValueToJson(JsonWriter &w, const Value &value) {
+yyjson_mut_val *ValueToJson(JsonWriter &w, const Value &value, vector<Photo> &photos) {
 	if (value.IsNull()) {
 		return yyjson_mut_null(w.doc);
 	}
 	auto &type = value.type();
+	Photo photo;
+	if (type.id() == LogicalTypeId::BLOB && Photo::Of(value, photo)) {
+		AddPhoto(photos, photo);
+		return w.Str(photo.ref);
+	}
 	switch (type.id()) {
 	case LogicalTypeId::BOOLEAN:
 		return yyjson_mut_bool(w.doc, value.GetValue<bool>());
@@ -72,7 +77,7 @@ yyjson_mut_val *ValueToJson(JsonWriter &w, const Value &value) {
 		auto obj = yyjson_mut_obj(w.doc);
 		auto &children = StructValue::GetChildren(value);
 		for (idx_t i = 0; i < children.size(); i++) {
-			yyjson_mut_obj_add(obj, w.Str(Str(StructType::GetChildName(type, i))), ValueToJson(w, children[i]));
+			yyjson_mut_obj_add(obj, w.Str(Str(StructType::GetChildName(type, i))), ValueToJson(w, children[i], photos));
 		}
 		return obj;
 	}
@@ -82,7 +87,7 @@ yyjson_mut_val *ValueToJson(JsonWriter &w, const Value &value) {
 		auto &children =
 		    type.id() == LogicalTypeId::LIST ? ListValue::GetChildren(value) : ArrayValue::GetChildren(value);
 		for (auto &child : children) {
-			yyjson_mut_arr_append(arr, ValueToJson(w, child));
+			yyjson_mut_arr_append(arr, ValueToJson(w, child, photos));
 		}
 		return arr;
 	}
@@ -92,12 +97,17 @@ yyjson_mut_val *ValueToJson(JsonWriter &w, const Value &value) {
 	}
 }
 
-string InputText(const Value &value) {
+string InputText(const Value &value, vector<Photo> &photos) {
 	if (value.type().id() == LogicalTypeId::VARCHAR) {
 		return StringValue::Get(value);
 	}
+	Photo photo;
+	if (value.type().id() == LogicalTypeId::BLOB && Photo::Of(value, photo)) {
+		AddPhoto(photos, photo);
+		return photo.ref; // the bare name, so the whole input is the picture
+	}
 	JsonWriter w;
-	return w.Write(ValueToJson(w, value));
+	return w.Write(ValueToJson(w, value, photos));
 }
 
 yyjson_val *Field(yyjson_val *obj, const char *key) {
@@ -124,7 +134,7 @@ string Question::Key() const {
 string Answer::ToJson(const Question &question) const {
 	JsonWriter w;
 	auto obj = yyjson_mut_obj(w.doc);
-	static const char *kind_names[] = {"yes_no", "pick", "score"};
+	static const char *kind_names[] = {"yes_no", "pick", "score", "box"};
 	yyjson_mut_obj_add_str(w.doc, obj, "type", kind_names[uint8_t(question.kind)]);
 	if (!error.empty()) {
 		yyjson_mut_obj_add(obj, w.Str("error"), w.Str(error));

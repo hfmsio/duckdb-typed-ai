@@ -35,6 +35,7 @@ set(EXTENSION_SOURCES
     src/runner.cpp
     src/profile.cpp
     src/json.cpp
+    src/image.cpp
     src/providers/jev.cpp
     src/providers/openai.cpp
     ${DUCKDB_MODULE_BASE_DIR}/third_party/yyjson/yyjson.cpp)

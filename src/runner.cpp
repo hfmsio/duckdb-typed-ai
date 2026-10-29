@@ -125,11 +125,6 @@ struct SlotGuard {
 	bool held;
 };
 
-//! Dollars with enough digits to be useful: $1.50, $0.0003.
-string Money(double usd) {
-	return usd >= 0.01 || usd == 0 ? StringUtil::Format("%.2f", usd) : StringUtil::Format("%.2g", usd);
-}
-
 string RowCapMessage(int64_t cap) {
 	return StringUtil::Format(
 	    "typed_ai: this query would send more than %d rows to the model (typed_max_rows). To allow more: "
@@ -335,17 +330,25 @@ vector<Answer> Run(ClientContext &context, QueryState &qs, OnStop mode, const ve
 	auto &s = qs.settings;
 	vector<Answer> answers(items.size());
 
-	// Too-long inputs are refused, never cut short in secret.
+	// Photos Jev would refuse, and too-long inputs, are refused here, never cut or resized in secret.
 	vector<idx_t> todo;
 	for (idx_t i = 0; i < items.size(); i++) {
-		if (int64_t(items[i].input.size()) <= s.max_input_chars) {
+		auto &item = items[i];
+		string why, fix;
+		if (item.HasPhotos()) {
+			why = PhotosProblem(item.photos, item.question->photos);
+		}
+		if (why.empty() && int64_t(item.input.size()) > s.max_input_chars) {
+			why = StringUtil::Format("input of %d characters is over typed_max_input_chars (%d)", item.input.size(),
+			                         s.max_input_chars);
+			fix = ". Shorten it, e.g. left(body, 4000), or raise the setting";
+		}
+		if (why.empty()) {
 			todo.push_back(i);
 			continue;
 		}
-		auto why = StringUtil::Format("input of %d characters is over typed_max_input_chars (%d)",
-		                              items[i].input.size(), s.max_input_chars);
 		if (mode == OnStop::ERROR) {
-			throw InvalidInputException("typed_ai: %s. Shorten it, e.g. left(body, 4000), or raise the setting", why);
+			throw InvalidInputException("typed_ai: %s%s", why, fix);
 		}
 		answers[i].error = "skipped: " + why;
 		qs.AddSkipped(1);
@@ -376,11 +379,24 @@ vector<Answer> Run(ClientContext &context, QueryState &qs, OnStop mode, const ve
 		todo.resize(granted);
 	}
 
-	// Batches of rows that share one request.
+	// Batches of rows that share one request. A row with photos goes alone: sharing saved only 7% on photos in
+	// tests, and Jev fails a whole request over one bad photo.
 	auto batch_size = idx_t(MinValue<int64_t>(s.batch_size, int64_t(qs.provider->Caps().max_rows_per_request)));
 	vector<vector<idx_t>> batches;
-	for (idx_t k = 0; k < todo.size(); k += batch_size) {
-		batches.emplace_back(todo.begin() + k, todo.begin() + MinValue<idx_t>(k + batch_size, todo.size()));
+	vector<idx_t> texts;
+	for (auto i : todo) {
+		if (items[i].HasPhotos()) {
+			batches.push_back({i});
+			continue;
+		}
+		texts.push_back(i);
+		if (texts.size() == batch_size) {
+			batches.push_back(std::move(texts));
+			texts.clear();
+		}
+	}
+	if (!texts.empty()) {
+		batches.push_back(std::move(texts));
 	}
 
 	if (!cap_reason.empty() && s.dry_run) {

@@ -68,6 +68,15 @@ SELECT count(typed_prob(body, 'q3')) FROM big;
 ----
 <REGEX>:.*budget of \$0.0003 reached.*rows were answered and saved.*Run the query again to continue.*
 
+# Tiny amounts print in full, never as 6e-05
+statement ok
+SET typed_budget_usd = 0.00006;
+
+statement error
+SELECT count(typed_prob(body, 'q3b')) FROM big;
+----
+<REGEX>:.*budget of \$0\.00006 reached.*and \$[0-9]+\.[0-9]+ has been spent.*
+
 # A rerun after raising the budget pays only for rows not yet answered
 statement ok
 SET typed_budget_usd = 10;
@@ -122,6 +131,120 @@ query I
 SELECT count(typed_prob(body, 'reports a broken part')) FROM t;
 ----
 2
+
+query I
+SELECT content FROM read_text('${TYPED_AI_MOCK}/count');
+----
+0
+
+# ---- photos, Jev ----
+
+# Test photos: real PNG and JPEG headers with a size and a note, and no pixels. The mock judges the bytes.
+statement ok
+CREATE MACRO png(w, h, note) AS from_hex('89504E470D0A1A0A0000000D49484452' || printf('%08X%08X', w, h)) || encode(note);
+
+statement ok
+CREATE MACRO jpg(w, h, note) AS from_hex('FFD8FFE000104A46494600010100000100010000FFC0001108' || printf('%04X%04X', h, w)
+                                       || '03011100021101031101') || encode(note);
+
+statement ok
+CREATE TABLE photos AS SELECT * FROM (VALUES
+    ('mug.png', png(1024, 768, 'a broken mug')),
+    ('cup.jpg', jpg(800, 600, 'a whole cup')),
+    ('bag.jpg', jpg(1568, 280, 'a bag with a broken strap'))) v(name, content);
+
+statement ok
+SELECT content FROM read_text('${TYPED_AI_MOCK}/reset');
+
+query II
+SELECT name, typed_is(content, 'is it broken?') FROM photos ORDER BY name;
+----
+bag.jpg	true
+cup.jpg	false
+mug.png	true
+
+# Each photo went in its own request, with Jev's preview header
+query II
+SELECT (SELECT content FROM read_text('${TYPED_AI_MOCK}/count')), (SELECT content FROM read_text('${TYPED_AI_MOCK}/photos'));
+----
+3	3
+
+# Photos and text in one query: the text rows still share a request
+statement ok
+SELECT content FROM read_text('${TYPED_AI_MOCK}/reset');
+
+query I
+SELECT count(typed_pick(v, 'which shelf?', ['mug', 'cup', 'bag'])) FROM (
+    SELECT content v FROM photos UNION ALL SELECT encode('text ' || i) FROM range(3) r(i));
+----
+6
+
+query II
+SELECT (SELECT content FROM read_text('${TYPED_AI_MOCK}/count')), (SELECT content FROM read_text('${TYPED_AI_MOCK}/photos'));
+----
+4	3
+
+# A photo Jev would refuse is never sent
+statement ok
+SELECT content FROM read_text('${TYPED_AI_MOCK}/reset');
+
+statement error
+SELECT typed_is(png(2000, 1000, 'big'), 'is it broken?');
+----
+this photo is 2000 x 1000 pixels; each side must be 280 to 1568
+
+query I
+SELECT content FROM read_text('${TYPED_AI_MOCK}/count');
+----
+0
+
+# A photo inside a row goes with the row's other columns, in one request per row
+statement ok
+SELECT content FROM read_text('${TYPED_AI_MOCK}/reset');
+
+query II
+SELECT name, typed_is({photo: content, note: 'found on a train'}, 'is it broken?') FROM photos ORDER BY name;
+----
+bag.jpg	true
+cup.jpg	false
+mug.png	true
+
+query II
+SELECT (SELECT content FROM read_text('${TYPED_AI_MOCK}/count')), (SELECT content FROM read_text('${TYPED_AI_MOCK}/photos'));
+----
+3	3
+
+# Options defined by pictures: each row also carries every option's picture, each sent once
+statement ok
+SELECT content FROM read_text('${TYPED_AI_MOCK}/reset');
+
+query II
+SELECT name, typed_pick(content, 'which report?', (
+    SELECT MAP {'none': NULL::BLOB, 'report 1': any_value(content) FILTER (name = 'mug.png'),
+                'report 2': any_value(content) FILTER (name = 'cup.jpg')} FROM photos)) FROM photos ORDER BY name;
+----
+bag.jpg	none
+cup.jpg	report 2
+mug.png	report 1
+
+# bag: its own photo and two options; cup and mug: their own photo is also an option, so it is sent once
+query II
+SELECT (SELECT content FROM read_text('${TYPED_AI_MOCK}/count')), (SELECT content FROM read_text('${TYPED_AI_MOCK}/photos'));
+----
+3	7
+
+# Where is it: a box as fractions of the photo, and how sure Jev is
+query IIIII
+SELECT b.left, b.top, b.right, b.bottom, b.confidence FROM (SELECT typed_box(content, 'the strap') b FROM photos WHERE name = 'bag.jpg');
+----
+0.25	0.1	0.75	0.9	0.8
+
+# A second run is answered from the cache
+statement ok
+SELECT content FROM read_text('${TYPED_AI_MOCK}/reset');
+
+statement ok
+SELECT typed_box(content, 'the strap') FROM photos WHERE name = 'bag.jpg';
 
 query I
 SELECT content FROM read_text('${TYPED_AI_MOCK}/count');

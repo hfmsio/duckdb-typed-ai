@@ -63,7 +63,7 @@ int64_t LabelIndex(string token, const vector<string> &labels, Kind kind) {
 class OpenAIProvider : public Provider {
 public:
 	Capabilities Caps() const override {
-		return {1, 26, 10, false, 60};
+		return {1, 26, 10, false, 60, false};
 	}
 	Price DefaultPrice() const override {
 		return Price();

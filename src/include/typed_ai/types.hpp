@@ -1,12 +1,13 @@
 #pragma once
 
 #include "duckdb.hpp"
+#include "typed_ai/image.hpp"
 
 namespace duckdb {
 namespace typed_ai {
 
-//! The three kinds of question every provider must answer.
-enum class Kind : uint8_t { YES_NO, PICK, SCORE };
+//! The three kinds of question every provider must answer, plus BOX (where is it in a photo), which only Jev does.
+enum class Kind : uint8_t { YES_NO, PICK, SCORE, BOX };
 
 //! One typed question, in typed_ai's own provider-neutral shape.
 struct Question {
@@ -16,17 +17,25 @@ struct Question {
 	vector<string> options;
 	//! Optional JSON object: {"true": .., "false": ..} for YES_NO, {option: description} for PICK.
 	string criteria_json;
+	//! Pictures that define PICK options; criteria_json names each by its ref.
+	vector<Photo> photos;
 
 	//! Stable text that identifies the question, used in the cache key.
 	string Key() const;
 };
 
-//! One row to judge: the input text and the question asked about it.
+//! One row to judge: the input and the question asked about it.
 struct Item {
 	Item(string input, const Question *question) : input(std::move(input)), question(question) {
 	}
+	//! Text or JSON. A photo in it appears as its ref.
 	string input;
 	const Question *question;
+	vector<Photo> photos;
+
+	bool HasPhotos() const {
+		return !photos.empty() || !question->photos.empty();
+	}
 };
 
 //! A provider's answer to one item. `error` is empty on success.
@@ -38,6 +47,8 @@ struct Answer {
 	vector<double> probabilities;
 	//! -1 when the provider reports none.
 	double confidence = -1;
+	//! BOX: the edges, as fractions of the photo's width (left, right) and height (top, bottom).
+	double left = 0, top = 0, right = 0, bottom = 0;
 	string model;
 	bool calibrated = false;
 	string error;
@@ -75,6 +86,8 @@ struct Capabilities {
 	bool calibrated;
 	//! Fixed input tokens each request adds on top of the rows, for the cost estimate.
 	idx_t overhead_tokens_per_request;
+	//! Reads photos (PNG and JPEG BLOBs).
+	bool images;
 };
 
 //! Everything needed to talk to one provider. Built from a DuckDB secret.

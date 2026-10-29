@@ -3,12 +3,15 @@
 #include "typed_ai/json.hpp"
 #include "typed_ai/provider.hpp"
 
+#include "duckdb/common/types/blob.hpp"
+
 namespace duckdb {
 namespace typed_ai {
 
 namespace {
 
-//! A row that is itself JSON (a struct or whole row) goes in as structure, anything else as text.
+//! A row that is itself JSON (a struct or whole row) goes in as structure, anything else as text. Photos in it
+//! appear by ref.
 yyjson_mut_val *InputValue(JsonWriter &w, const string &input) {
 	if (!input.empty() && (input[0] == '{' || input[0] == '[')) {
 		JsonDoc parsed(input);
@@ -19,9 +22,24 @@ yyjson_mut_val *InputValue(JsonWriter &w, const string &input) {
 	return w.Str(input);
 }
 
+//! Lists each photo under its ref in `assets`; Jev swaps every place the ref appears for the picture.
+void AddAssets(JsonWriter &w, yyjson_mut_val *assets, const vector<Photo> &photos) {
+	for (auto &photo : photos) {
+		if (yyjson_mut_obj_get(assets, photo.ref.c_str())) {
+			continue;
+		}
+		auto asset = yyjson_mut_obj(w.doc);
+		yyjson_mut_obj_add_str(w.doc, asset, "type", "image");
+		yyjson_mut_obj_add(asset, w.Str("format"), w.Str(photo.image.format));
+		auto &bytes = *photo.bytes;
+		yyjson_mut_obj_add(asset, w.Str("data_base64"), w.Str(Blob::ToBase64(string_t(bytes.data(), bytes.size()))));
+		yyjson_mut_obj_add(assets, w.Str(photo.ref), asset);
+	}
+}
+
 yyjson_mut_val *QuestionJson(JsonWriter &w, const Question &q, yyjson_mut_val *instructions) {
 	auto obj = yyjson_mut_obj(w.doc);
-	static const char *types[] = {"noul", "choice", "score"};
+	static const char *types[] = {"noul", "choice", "score", "box"};
 	yyjson_mut_obj_add_str(w.doc, obj, "type", types[uint8_t(q.kind)]);
 	yyjson_mut_obj_add_val(w.doc, obj, "instructions", instructions);
 
@@ -38,7 +56,7 @@ yyjson_mut_val *QuestionJson(JsonWriter &w, const Question &q, yyjson_mut_val *i
 			yyjson_mut_obj_add(criteria, w.Str(option), value);
 		}
 		yyjson_mut_obj_add_val(w.doc, obj, "criteria", criteria);
-	} else {
+	} else if (q.kind == Kind::SCORE) {
 		auto levels = yyjson_mut_arr(w.doc);
 		for (auto &level : q.options) {
 			yyjson_mut_arr_append(levels, w.Str(level));
@@ -62,7 +80,7 @@ vector<double> ReadProbabilities(yyjson_val *answer, const Question &q) {
 class JevProvider : public Provider {
 public:
 	Capabilities Caps() const override {
-		return {50, 255, 10, true, 300};
+		return {50, 255, 10, true, 300, true};
 	}
 	Price DefaultPrice() const override {
 		return Price(0.042, 0);
@@ -79,6 +97,7 @@ public:
 		auto root = yyjson_mut_obj(w.doc);
 		yyjson_mut_obj_add(root, w.Str("model"), w.Str(profile.model));
 		auto questions = yyjson_mut_obj(w.doc);
+		auto assets = yyjson_mut_obj(w.doc);
 
 		if (items.size() == 1) {
 			// One row: the row is the whole state, the question is asked plainly.
@@ -100,10 +119,22 @@ public:
 			yyjson_mut_obj_add_val(w.doc, root, "state", state);
 		}
 		yyjson_mut_obj_add_val(w.doc, root, "questions", questions);
+		for (auto &item : items) {
+			AddAssets(w, assets, item.photos);
+			AddAssets(w, assets, item.question->photos);
+		}
+		bool photos = yyjson_mut_obj_size(assets) > 0;
+		if (photos) {
+			yyjson_mut_obj_add_val(w.doc, root, "assets", assets);
+		}
 
 		HttpCall call;
 		call.url = profile.url;
 		call.headers = {{"Content-Type", "application/json"}, {"Authorization", "Bearer " + profile.api_key}};
+		if (photos) {
+			// Jev's photo support is a preview and must be asked for on each request.
+			call.headers.emplace_back("TypeSafe-Danger-Zone-Images", "true");
+		}
 		call.body = w.Write(root);
 		return call;
 	}
@@ -134,6 +165,15 @@ public:
 			answer.confidence = GetNumber(Field(a, "confidence"));
 			if (q.kind == Kind::YES_NO) {
 				answer.value = GetNumber(Field(a, "noul"));
+			} else if (q.kind == Kind::BOX) {
+				// No value of its own: a box with all four edges counts as the answer.
+				auto box = Field(a, "box");
+				answer.left = GetNumber(Field(box, "left"));
+				answer.top = GetNumber(Field(box, "top"));
+				answer.right = GetNumber(Field(box, "right"));
+				answer.bottom = GetNumber(Field(box, "bottom"));
+				bool whole = answer.left >= 0 && answer.top >= 0 && answer.right >= 0 && answer.bottom >= 0;
+				answer.value = whole ? MaxValue(answer.confidence, 0.0) : -1;
 			} else if (q.kind == Kind::PICK) {
 				answer.choice = GetString(a, "choice");
 				answer.probabilities = ReadProbabilities(a, q);

@@ -5,6 +5,8 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
 
+#include <cmath>
+
 namespace duckdb {
 namespace typed_ai {
 
@@ -395,6 +397,11 @@ double EstimateUsd(const QueryState &qs, const vector<Item> &items, double scale
 			chars += option.size() + 4;
 		}
 		usage.input_tokens += chars / 4 + 1;
+		for (auto list : {&item.photos, &item.question->photos}) {
+			for (auto &photo : *list) {
+				usage.input_tokens += photo.image.Tokens();
+			}
+		}
 		usage.output_tokens += 2;
 	}
 	return qs.profile.price.Cost(usage) * scale;
@@ -415,13 +422,24 @@ void CheckQuestion(const Question &q, const Capabilities &caps, const string &pr
 	}
 }
 
+string Money(double usd) {
+	if (usd >= 0.01 || usd <= 0) {
+		return StringUtil::Format("%.2f", usd);
+	}
+	// Two significant digits, written out in full, then trailing zeros dropped.
+	auto decimals = MinValue<int>(12, 1 - int(std::floor(std::log10(usd))));
+	auto text = StringUtil::Format("%.*f", decimals, usd);
+	text.erase(text.find_last_not_of('0') + 1);
+	return text.back() == '.' ? "0.00" : text;
+}
+
 string StopMessage(ClientContext &context, QueryState &qs, const string &reason) {
 	auto summary = qs.Current();
 	auto spent = DatabaseState::Get(context).Snapshot().spent_usd;
-	return StringUtil::Format("typed_ai: %s. %d rows were answered and saved in this query, and $%.4f has been spent "
+	return StringUtil::Format("typed_ai: %s. %d rows were answered and saved in this query, and $%s has been spent "
 	                          "in total. Run the query again to continue: saved answers cost nothing. Requests already "
 	                          "in flight when it stopped may still be billed.",
-	                          reason, summary.rows_answered, spent);
+	                          reason, summary.rows_answered, Money(spent));
 }
 
 } // namespace typed_ai

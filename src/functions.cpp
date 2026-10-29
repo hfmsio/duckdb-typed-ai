@@ -6,6 +6,8 @@
 
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 
 namespace duckdb {
@@ -13,7 +15,7 @@ namespace typed_ai {
 
 namespace {
 
-enum class Shape : uint8_t { IS, PROB, PICK, SCORE, ASK };
+enum class Shape : uint8_t { IS, PROB, PICK, SCORE, ASK, BOX };
 
 struct TypedBindData : public FunctionData {
 	TypedBindData(Shape shape, OnStop mode) : shape(shape), mode(mode) {
@@ -32,7 +34,58 @@ struct TypedBindData : public FunctionData {
 };
 
 Kind KindOf(Shape shape) {
-	return shape == Shape::PICK ? Kind::PICK : shape == Shape::SCORE ? Kind::SCORE : Kind::YES_NO;
+	return shape == Shape::PICK    ? Kind::PICK
+	       : shape == Shape::SCORE ? Kind::SCORE
+	       : shape == Shape::BOX   ? Kind::BOX
+	                               : Kind::YES_NO;
+}
+
+//! Options from a list of names, or from a MAP of name to picture (NULL for an option with no picture).
+void ReadOptions(const Value &options, Question &q) {
+	if (options.type().id() != LogicalTypeId::MAP) {
+		for (auto &option : ListValue::GetChildren(options)) {
+			if (option.IsNull()) {
+				throw InvalidInputException("typed_ai: the options list contains NULL");
+			}
+			q.options.push_back(option.ToString());
+		}
+		return;
+	}
+	JsonWriter w;
+	auto criteria = yyjson_mut_obj(w.doc);
+	for (auto &entry : ListValue::GetChildren(options)) {
+		auto &pair = StructValue::GetChildren(entry);
+		if (pair[0].IsNull()) {
+			throw InvalidInputException("typed_ai: the options map has a NULL name");
+		}
+		auto name = pair[0].ToString();
+		q.options.push_back(name);
+		Photo photo;
+		if (pair[1].IsNull()) {
+			yyjson_mut_obj_add(criteria, w.Str(name), yyjson_mut_null(w.doc));
+			continue;
+		}
+		auto why = Photo::Of(pair[1], photo) ? photo.image.Problem(photo.bytes->size()) : "it is not a photo";
+		if (!why.empty()) {
+			throw InvalidInputException("typed_ai: the picture for option '%s': %s", name, why);
+		}
+		AddPhoto(q.photos, photo);
+		yyjson_mut_obj_add(criteria, w.Str(name), w.Str(photo.ref));
+	}
+	q.criteria_json = w.Write(criteria);
+}
+
+//! Why this row cannot go to this provider, or empty. Photos and typed_box need a provider that sees pictures.
+string Unsupported(const Question &q, const vector<Photo> &photos, const Capabilities &caps, const Profile &profile) {
+	if (q.kind == Kind::BOX && photos.empty()) {
+		return "typed_box needs a photo (a PNG or JPEG BLOB) as its first argument, e.g. content from read_blob";
+	}
+	if ((photos.empty() && q.photos.empty() && q.kind != Kind::BOX) || caps.images) {
+		return "";
+	}
+	return StringUtil::Format("%s works only with provider 'jev' for now; profile '%s' uses '%s'. Add a Jev "
+	                          "profile and SET typed_profile to its name",
+	                          q.kind == Kind::BOX ? "typed_box" : "sending photos", profile.name, profile.provider);
 }
 
 //! typed_ask's question: {"v": 1, "type": "yes_no"|"pick"|"score", "question": "..", "options"|"levels": [..],
@@ -84,16 +137,29 @@ Question QuestionAt(const TypedBindData &bind, DataChunk &args, idx_t row) {
 	Question q;
 	q.kind = KindOf(bind.shape);
 	q.text = args.GetValue(1, row).ToString();
-	if (q.kind != Kind::YES_NO) {
-		auto list = args.GetValue(2, row); // keep it alive while we read its children
-		for (auto &option : ListValue::GetChildren(list)) {
-			if (option.IsNull()) {
-				throw InvalidInputException("typed_ai: the options list contains NULL");
-			}
-			q.options.push_back(option.ToString());
-		}
+	if (q.kind == Kind::PICK || q.kind == Kind::SCORE) {
+		ReadOptions(args.GetValue(2, row), q);
 	}
 	return q;
+}
+
+//! True when two rows ask the same question with the same options. Values are compared, not hashed: cheap next to
+//! reading them.
+bool SameQuestion(DataChunk &args, idx_t a, idx_t b) {
+	for (idx_t col = 1; col < args.ColumnCount(); col++) {
+		if (!Value::NotDistinctFrom(args.GetValue(col, a), args.GetValue(col, b))) {
+			return false;
+		}
+	}
+	return true;
+}
+
+LogicalType BoxType() {
+	return LogicalType::STRUCT({{"left", LogicalType::DOUBLE},
+	                            {"top", LogicalType::DOUBLE},
+	                            {"right", LogicalType::DOUBLE},
+	                            {"bottom", LogicalType::DOUBLE},
+	                            {"confidence", LogicalType::DOUBLE}});
 }
 
 Value ResultValue(const TypedBindData &bind, const LogicalType &type, const Answer &a, double threshold) {
@@ -104,6 +170,14 @@ Value ResultValue(const TypedBindData &bind, const LogicalType &type, const Answ
 		return answered ? Value::BOOLEAN(a.value >= threshold) : Value(type);
 	case Shape::PICK:
 		value = answered ? Value(a.choice) : Value(LogicalType::VARCHAR);
+		break;
+	case Shape::BOX:
+		value = answered ? Value::STRUCT({{"left", Value::DOUBLE(a.left)},
+		                                  {"top", Value::DOUBLE(a.top)},
+		                                  {"right", Value::DOUBLE(a.right)},
+		                                  {"bottom", Value::DOUBLE(a.bottom)},
+		                                  {"confidence", Value::DOUBLE(a.value)}})
+		                 : Value(BoxType());
 		break;
 	default:
 		value = answered ? Value::DOUBLE(a.value) : Value(LogicalType::DOUBLE);
@@ -144,19 +218,38 @@ void Execute(DataChunk &args, ExpressionState &state, Vector &result) {
 	vector<Item> items;
 	vector<CacheKey> keys;
 
+	idx_t previous = rows; // the last row whose question was read
 	for (idx_t row = 0; row < rows; row++) {
 		if (is_null[row]) {
 			continue; // NULL in, NULL out, no call
 		}
-		questions[row] = QuestionAt(bind, args, row);
-		CheckQuestion(questions[row], caps, qs.profile.provider);
-		auto input = InputText(args.GetValue(0, row));
+		// Rows usually share one question; reuse it, so option pictures are read and held once.
+		if (previous < rows && SameQuestion(args, previous, row)) {
+			questions[row] = questions[previous];
+		} else {
+			questions[row] = QuestionAt(bind, args, row);
+			CheckQuestion(questions[row], caps, qs.profile.provider);
+		}
+		previous = row;
+		vector<Photo> photos;
+		auto input = InputText(args.GetValue(0, row), photos);
+		auto why = Unsupported(questions[row], photos, caps, qs.profile);
+		if (!why.empty()) {
+			if (bind.mode == OnStop::ERROR) {
+				throw InvalidInputException("typed_ai: %s", why);
+			}
+			answers[row].error = "skipped: " + why;
+			qs.AddSkipped(1);
+			continue;
+		}
+		// A photo appears in the input by a hash of its bytes, so the key tells photos apart.
 		auto key = CacheKey::Of(qs.profile, questions[row], input);
 		if (db.Lookup(key, answers[row])) {
 			continue;
 		}
 		misses.push_back(row);
 		items.emplace_back(std::move(input), &questions[row]);
+		items.back().photos = std::move(photos);
 		keys.push_back(key);
 	}
 
@@ -189,7 +282,7 @@ LogicalType ReturnType(Shape shape, OnStop mode) {
 	if (shape == Shape::ASK) {
 		return LogicalType::JSON();
 	}
-	auto value = shape == Shape::PICK ? LogicalType::VARCHAR : LogicalType::DOUBLE;
+	auto value = shape == Shape::PICK ? LogicalType::VARCHAR : shape == Shape::BOX ? BoxType() : LogicalType::DOUBLE;
 	if (mode != OnStop::ROW) {
 		return value;
 	}
@@ -216,10 +309,8 @@ void CheckConstants(ClientContext &context, Shape shape, vector<unique_ptr<Expre
 			Question q;
 			q.kind = KindOf(shape);
 			q.text = "?";
-			for (auto &option : ListValue::GetChildren(options)) {
-				q.options.push_back(option.ToString());
-			}
-			CheckQuestion(q, {1, 255, 10, false, 0}, "");
+			ReadOptions(options, q);
+			CheckQuestion(q, {1, 255, 10, false, 0, false}, "");
 		}
 	}
 	if (shape == Shape::IS) {
@@ -350,17 +441,51 @@ void UsageScan(ClientContext &context, TableFunctionInput &input, DataChunk &out
 
 } // namespace
 
+//! Adds the one-line help that duckdb_functions() and the extension's store page show.
+template <class INFO, class FUNCTION>
+INFO Described(FUNCTION function, const string &description, const string &example) {
+	INFO info(std::move(function));
+	FunctionDescription help;
+	help.description = description;
+	help.examples = {example};
+	info.descriptions.push_back(help);
+	return info;
+}
+
 void RegisterFunctions(ExtensionLoader &loader) {
+	using Scalar = CreateScalarFunctionInfo;
 	auto list = LogicalType::LIST(LogicalType::VARCHAR);
 	ScalarFunctionSet is_set("typed_is");
 	is_set.AddFunction(Make<Shape::IS>("typed_is", {LogicalType::ANY, LogicalType::VARCHAR}));
 	is_set.AddFunction(Make<Shape::IS>("typed_is", {LogicalType::ANY, LogicalType::VARCHAR, LogicalType::DOUBLE}));
-	loader.RegisterFunction(is_set);
-	loader.RegisterFunction(Make<Shape::PROB>("typed_prob", {LogicalType::ANY, LogicalType::VARCHAR}));
-	loader.RegisterFunction(Make<Shape::PICK>("typed_pick", {LogicalType::ANY, LogicalType::VARCHAR, list}));
-	loader.RegisterFunction(Make<Shape::SCORE>("typed_score", {LogicalType::ANY, LogicalType::VARCHAR, list}));
-	loader.RegisterFunction(Make<Shape::ASK>("typed_ask", {LogicalType::ANY, LogicalType::VARCHAR}));
-	loader.RegisterFunction(TableFunction(Id("typed_usage"), {}, UsageScan, UsageBind, UsageInit));
+	loader.RegisterFunction(Described<Scalar>(is_set,
+	                                          "True when the AI thinks the statement is true (cutoff 0.5 unless given)",
+	                                          "typed_is(review, 'the customer is angry')"));
+	loader.RegisterFunction(Described<Scalar>(Make<Shape::PROB>("typed_prob", {LogicalType::ANY, LogicalType::VARCHAR}),
+	                                          "How likely the statement is true, from 0 to 1",
+	                                          "typed_prob(item, 'the owner needs this back today')"));
+	ScalarFunctionSet pick_set("typed_pick");
+	pick_set.AddFunction(Make<Shape::PICK>("typed_pick", {LogicalType::ANY, LogicalType::VARCHAR, list}));
+	pick_set.AddFunction(Make<Shape::PICK>("typed_pick", {LogicalType::ANY, LogicalType::VARCHAR,
+	                                                      LogicalType::MAP(LogicalType::VARCHAR, LogicalType::BLOB)}));
+	loader.RegisterFunction(Described<Scalar>(
+	    pick_set, "The option that fits best; options are names, or a MAP of name to picture (Jev only)",
+	    "typed_pick(item, 'which shelf?', ['food', 'tools', 'other'])"));
+	loader.RegisterFunction(
+	    Described<Scalar>(Make<Shape::SCORE>("typed_score", {LogicalType::ANY, LogicalType::VARCHAR, list}),
+	                      "A rating: 0 for the first level, 1 for the next, and so on",
+	                      "typed_score(answer, 'how helpful is it?', ['not', 'a bit', 'very'])"));
+	loader.RegisterFunction(Described<Scalar>(Make<Shape::ASK>("typed_ask", {LogicalType::ANY, LogicalType::VARCHAR}),
+	                                          "The full answer as JSON, with the odds for every option",
+	                                          "typed_ask(note, '{\"v\": 1, \"type\": \"pick\", \"question\": \"how "
+	                                          "urgent?\", \"options\": [\"now\", \"later\"]}')"));
+	loader.RegisterFunction(
+	    Described<Scalar>(Make<Shape::BOX>("typed_box", {LogicalType::ANY, LogicalType::VARCHAR}),
+	                      "Where something is in a photo: box edges from 0 to 1, and confidence (Jev only)",
+	                      "typed_box(content, 'the coffee mug')"));
+	loader.RegisterFunction(Described<CreateTableFunctionInfo>(
+	    TableFunction(Id("typed_usage"), {}, UsageScan, UsageBind, UsageInit),
+	    "What has been spent, the limit, and how many answers were reused", "FROM typed_usage()"));
 }
 
 } // namespace typed_ai

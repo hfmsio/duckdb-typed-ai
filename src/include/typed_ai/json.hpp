@@ -2,6 +2,7 @@
 
 #include "duckdb.hpp"
 #include "yyjson.hpp"
+#include "typed_ai/image.hpp"
 
 namespace duckdb {
 namespace typed_ai {
@@ -36,11 +37,12 @@ struct JsonWriter {
 	string Write(yyjson_mut_val *root);
 };
 
-//! A DuckDB value as JSON: structs become objects, lists become arrays, so column names reach the model.
-yyjson_mut_val *ValueToJson(JsonWriter &w, const Value &value);
+//! A DuckDB value as JSON: structs become objects, lists become arrays, so column names reach the model. A photo
+//! becomes its ref and is added to `photos`.
+yyjson_mut_val *ValueToJson(JsonWriter &w, const Value &value, vector<Photo> &photos);
 
-//! The text a row is judged on: strings as they are, anything else as JSON.
-string InputText(const Value &value);
+//! The text a row is judged on: strings as they are, a photo as its ref, anything else as JSON.
+string InputText(const Value &value, vector<Photo> &photos);
 
 // Small readers that return a fallback when the field is missing or has the wrong type.
 yyjson_val *Field(yyjson_val *obj, const char *key);

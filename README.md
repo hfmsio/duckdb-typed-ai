@@ -3,6 +3,10 @@
 A DuckDB extension that asks a model typed questions about rows: yes/no, pick one, or a score. Answers are
 probabilities from the model's own odds, and spending is capped from the first query.
 
+New in 0.1.1: point it at a folder of photos and ask the same questions about each picture, compare a photo with
+its row's text, match photos against example pictures, or find where something is in a photo (Jev only, in
+preview). See [Photos](#photos).
+
 Two providers ship: [TypeSafe Jev](https://docs.typesafe.ai) and any OpenAI-compatible server that returns
 `logprobs`, such as OpenAI or a local Ollama.
 
@@ -12,6 +16,7 @@ Two providers ship: [TypeSafe Jev](https://docs.typesafe.ai) and any OpenAI-comp
 - [Walkthrough for a first session](#walkthrough-for-a-first-session)
 - [Safety first](#safety-first)
 - [Functions](#functions)
+- [Photos](#photos)
 - [Cost controls](#cost-controls)
 - [When a job stops partway](#when-a-job-stops-partway)
 - [Profiles](#profiles)
@@ -278,13 +283,14 @@ if the estimate was low.
 | --- | --- |
 | `typed_is(input, statement [, threshold])` | `BOOLEAN`: probability of yes at or above the threshold (default 0.5) |
 | `typed_prob(input, statement)` | `DOUBLE`: probability of yes, 0 to 1 |
-| `typed_pick(input, question, options)` | `VARCHAR`: the option the model rates highest; options can come from a table |
+| `typed_pick(input, question, options)` | `VARCHAR`: the option the model rates highest; options can come from a table, or be pictures |
 | `typed_score(input, question, levels)` | `DOUBLE`: probability-weighted level, 0 to n-1 |
+| `typed_box(photo, target)` | `STRUCT`: where the target is in the photo, and how sure (Jev only) |
 | `typed_ask(input, question_json)` | `JSON`: the full answer with probabilities, confidence, model and whether it is calibrated |
 | `typed_usage()` | one row: spend, budget, requests, retries, cache, breaker, and the last query's counts |
 
 `input` can be any value. Text is sent as it is; a struct or a whole row (`b` in `FROM bot_answers b`) is sent as
-JSON, so column names reach the model. Send only the columns the question needs: it costs less and reads better.
+JSON, so column names reach the model. A PNG or JPEG `BLOB` is sent as a picture (see [Photos](#photos)). Send only the columns the question needs: it costs less and reads better.
 
 A `NULL` argument gives a `NULL` answer and makes no call.
 
@@ -298,6 +304,79 @@ SELECT typed_ask(answer, '{"v": 1, "type": "pick", "question": "what kind of mis
 
 `type` is `yes_no`, `pick` (with `options`) or `score` (with `levels`, lowest first). The result is `JSON`; without
 DuckDB's `json` extension loaded, cast it with `::VARCHAR` before comparing it as text.
+
+## Photos
+
+With Jev (in preview), a `BLOB` holding a PNG or JPEG file is sent as a picture, so `read_blob` turns a folder of
+photos into rows. Every function takes a photo as its input:
+
+```sql
+CREATE TABLE found AS SELECT parse_filename(filename, true) AS item, content FROM read_blob('found/*.jpg');
+
+SELECT item, typed_pick(content, 'which shelf?', ['medical', 'electronics', 'valuables', 'animals',
+                                                  'food and rubbish', 'general']) AS shelf
+FROM found;
+-- hearing_aid      medical
+-- leather_wallet   valuables
+-- sandwich         food and rubbish
+```
+
+### Photo and text together
+
+A photo inside a struct or a whole row goes with the other columns, so a question can compare them:
+
+```sql
+SELECT item, note, typed_prob({photo: content, note: note}, 'the note correctly describes the photo') AS matches
+FROM found JOIN desk USING (item) ORDER BY matches DESC;
+-- teddy_bear       teddy bear in a red jumper               0.96
+-- leather_wallet   black leather wallet with cards inside   0.91
+-- wristwatch       silver digital watch                     0.01   (it is a gold watch)
+```
+
+### Options as pictures
+
+`typed_pick` also takes a `MAP` of option name to picture. Here each lost-item report is the owner's photo; an
+option with a `NULL` picture is judged by its name alone:
+
+```sql
+SELECT item, typed_pick(content, 'which lost-item report is the item in this photo?',
+         (SELECT map_concat(map(list(report), list(photo)), MAP {'no report matches': NULL::BLOB}) FROM reports))
+FROM found;
+-- found_glasses_blue   glasses_blue
+-- found_bottle_blue    bottle_blue
+-- sandwich             no report matches
+```
+
+Picking among several pictures is more reliable than asking yes or no about one: in our test, a blue bottle
+scored 0.61 for "the same item as this silver bottle" on its own, but was matched to the right report when all
+reports were options.
+
+### Where something is
+
+`typed_box(photo, target)` returns the smallest box around the target, with each edge as a fraction of the photo's
+width or height, and how sure Jev is:
+
+```sql
+SELECT item, typed_box(content, 'the winding crown') AS crown FROM found WHERE item = 'wristwatch';
+-- {'left': 0.1, 'top': 0.73, 'right': 0.22, 'bottom': 0.88, 'confidence': 0.89}
+```
+
+A box always comes back, even for something that is not there. Ask `typed_is(content, 'is there a winding crown?')`
+first when it might be missing.
+
+### Limits and cost
+
+- Each side must be 280 to 1568 pixels and each file at most 16 MB; one row's photos together, including option
+  pictures, at most 23 MB. Jev refuses other sizes, so typed_ai checks first and sends nothing for those rows. To
+  shrink a folder: `magick mogrify -resize '1568x1568>' *.jpg`.
+- A photo costs about one input token per 380 pixels: a 1024 x 768 photo is about $0.0001 with Jev. Option
+  pictures go with every row, so four of them make each row about five times the price. Dry runs, the budget and
+  the row cap count every photo.
+- A row with photos goes in its own request.
+- Jev calls this support a preview: its format, limits and accuracy can change between releases. In our test
+  (October 2026), 15 of 16 photos of lost items landed on the right shelf.
+- Other providers do not read photos yet. A query that sends one stops with a message saying so; with
+  `typed_on_stop = 'row'`, only those rows are skipped, with the reason.
 
 ## Cost controls
 

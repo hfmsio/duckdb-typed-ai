@@ -41,6 +41,45 @@ FROM t WHERE id = 1;
 ----
 true
 
+# Photos, from files (Jev's photo support is a preview)
+query II
+SELECT parse_filename(filename), typed_pick(content, 'what shape is drawn?', ['circle', 'square', 'triangle'])
+FROM read_blob('test/data/*') ORDER BY 1;
+----
+blue_square.png	square
+red_circle.jpg	circle
+
+query I
+SELECT typed_is(content, 'the shape is red') FROM read_blob('test/data/red_circle.jpg');
+----
+true
+
+# A photo with the row's other columns
+query II
+SELECT parse_filename(filename), typed_is({photo: content, note: 'a blue square'}, 'the note correctly describes the photo')
+FROM read_blob('test/data/*') ORDER BY 1;
+----
+blue_square.png	true
+red_circle.jpg	false
+
+# Options defined by pictures
+query II
+SELECT parse_filename(filename), typed_pick(content, 'which picture shows the same thing?',
+    (SELECT MAP {'square': any_value(content) FILTER (filename LIKE '%square%'),
+                 'circle': any_value(content) FILTER (filename LIKE '%circle%'), 'neither': NULL::BLOB}
+     FROM read_blob('test/data/*')))
+FROM read_blob('test/data/*') ORDER BY 1;
+----
+blue_square.png	square
+red_circle.jpg	circle
+
+# Where is it: the circle sits in the middle of its picture
+query I
+SELECT b.left < 0.5 AND b.right > 0.5 AND b.top < 0.5 AND b.bottom > 0.5 AND b.confidence > 0
+FROM (SELECT typed_box(content, 'the red circle') b FROM read_blob('test/data/red_circle.jpg'));
+----
+true
+
 query I
 SELECT spent_usd > 0 AND spent_usd < 0.001 FROM typed_usage();
 ----

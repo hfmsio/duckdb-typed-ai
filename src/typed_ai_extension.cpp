@@ -35,19 +35,23 @@ static void LoadInternal(ExtensionLoader &loader) {
 	       Value::DOUBLE(1.0));
 	global("typed_max_input_chars", "Longest input value, in characters; longer values are refused, never cut",
 	       Value::BIGINT(20000));
-	global("typed_cache_mb", "Memory for saved answers", Value::BIGINT(256));
-	global("typed_concurrency", "Requests in flight across the whole process", Value::BIGINT(4));
+	global("typed_cache_mb", "Memory, in MB, for saved answers", Value::BIGINT(256));
+	global("typed_concurrency", "Most requests sent at the same time", Value::BIGINT(4));
 
 	// Knobs: per session.
 	session("typed_profile",
 	        "Name of the typed_ai secret to use; empty picks the only one, or Jev from TYPESAFE_API_KEY", Value(""));
 	session("typed_dry_run", "Price queries and call nothing; results are NULL", Value::BOOLEAN(false));
-	session("typed_on_stop", "What a stopped job shows: 'error', 'null' or 'row' ({value, error} pairs)",
+	session("typed_on_stop",
+	        "What a stopped job shows: 'error' fails the query, 'null' leaves answers empty, 'row' adds the reason to "
+	        "each row",
 	        Value("error"), CheckOnStop);
 	session("typed_batch_size", "Rows per request, up to the provider's limit", Value::BIGINT(10));
-	session("typed_timeout_s", "Seconds per HTTP attempt", Value::BIGINT(30));
-	session("typed_max_retries", "Extra attempts after a 408, 429, 5xx or dropped connection", Value::BIGINT(3));
-	session("typed_fail_after", "Failed requests in a row that stop calls for the rest of the query; 0 is off",
+	session("typed_timeout_s", "Seconds to wait for each try", Value::BIGINT(30));
+	session("typed_max_retries", "Extra tries when the AI service is busy, down or drops the connection",
+	        Value::BIGINT(3));
+	session("typed_fail_after",
+	        "Stop asking for the rest of the query after this many failed requests in a row; 0 never stops",
 	        Value::BIGINT(3));
 
 	typed_ai::RegisterSecretType(loader);

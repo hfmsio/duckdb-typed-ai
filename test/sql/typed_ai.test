@@ -187,6 +187,157 @@ NULL
 statement ok
 SET typed_profile = 'free_jev';
 
+# Photos: a PNG or JPEG BLOB goes in as a picture. These have real headers and no pixels; nothing is sent.
+statement ok
+CREATE MACRO png(w, h) AS from_hex('89504E470D0A1A0A0000000D49484452' || printf('%08X%08X', w, h));
+
+statement ok
+CREATE MACRO jpg(w, h) AS from_hex('FFD8FFE000104A46494600010100000100010000FFC0001108' || printf('%04X%04X', h, w)
+                                 || '03011100021101031101');
+
+statement ok
+SET typed_on_stop = 'row';
+
+query II
+SELECT name, typed_prob(content, 'is it broken?').error FROM (VALUES
+    ('ok png', png(1024, 768)), ('ok jpg', jpg(1568, 280)), ('small', png(279, 600)), ('large', jpg(1569, 400)),
+    ('gif', encode('GIF89a') || png(500, 500)), ('cut short', from_hex('FFD8FFE00010')), ('not a photo', encode('just bytes'))
+) v(name, content) ORDER BY name;
+----
+cut short	skipped: this photo's size could not be read; the file may be damaged. Save it again as PNG or JPEG
+gif	skipped: this photo is GIF; only PNG and JPEG photos work. Convert it first
+large	skipped: this photo is 1569 x 400 pixels; each side must be 280 to 1568. Resize it first, e.g. magick mogrify -resize '1568x1568>' *.jpg
+not a photo	dry run: no call made
+ok jpg	dry run: no call made
+ok png	dry run: no call made
+small	skipped: this photo is 279 x 600 pixels; each side must be 280 to 1568. Resize it first, e.g. magick mogrify -resize '1568x1568>' *.jpg
+
+statement ok
+RESET typed_on_stop;
+
+# A photo is priced by its pixels: a 1568 x 1568 photo is about 7,000 tokens, about $0.0003 at Jev's price
+statement ok
+CREATE TABLE before AS SELECT dry_run_usd FROM typed_usage();
+
+statement ok
+SELECT typed_is(png(1568, 1568), 'is it broken?');
+
+query I
+SELECT (SELECT dry_run_usd FROM typed_usage()) - dry_run_usd BETWEEN 0.00028 AND 0.00034 FROM before;
+----
+true
+
+# Every photo is priced: one inside a row, and each picture option, which goes with every row
+statement ok
+CREATE OR REPLACE TABLE before AS SELECT dry_run_usd FROM typed_usage();
+
+statement ok
+SELECT typed_is({photo: png(1568, 1568), note: 'a red mug'}, 'the note matches the photo'),
+       typed_pick('a mug', 'which report?', MAP {'r1': png(1568, 1568), 'r2': jpg(1568, 1568), 'none': NULL::BLOB});
+
+query I
+SELECT (SELECT dry_run_usd FROM typed_usage()) - dry_run_usd BETWEEN 3 * 0.00028 AND 3 * 0.00034 FROM before;
+----
+true
+
+# The same photo twice in a row is sent once
+statement ok
+CREATE OR REPLACE TABLE before AS SELECT dry_run_usd FROM typed_usage();
+
+statement ok
+SELECT typed_is({a: png(1568, 1568), b: png(1568, 1568)}, 'same?');
+
+query I
+SELECT (SELECT dry_run_usd FROM typed_usage()) - dry_run_usd BETWEEN 0.00028 AND 0.00034 FROM before;
+----
+true
+
+# typed_box answers with the box's edges and how sure Jev is
+query I
+SELECT typeof(typed_box(png(1024, 768), 'the mug'));
+----
+STRUCT("left" DOUBLE, top DOUBLE, "right" DOUBLE, bottom DOUBLE, confidence DOUBLE)
+
+statement error
+SELECT typed_box('a mug on a table', 'the mug');
+----
+typed_box needs a photo (a PNG or JPEG BLOB) as its first argument
+
+# Photos inside one row share one request, so together they must fit in it
+statement ok
+SELECT typed_is({a: png(1000, 1000) || repeat('a', 12000000)::BLOB, b: png(1000, 1000) || repeat('b', 12000000)::BLOB}, 'same?');
+
+statement error
+SELECT typed_is({a: png(1000, 1000) || repeat('a', 12000000)::BLOB, b: png(1000, 1000) || repeat('b', 13000000)::BLOB}, 'same?');
+----
+this row's photos add up to 23.8 MB; one request takes at most 23 MB. Use fewer or smaller photos
+
+# An option's picture must be a photo Jev takes; this is checked before any row is read
+statement error
+SELECT typed_pick(x, 'which?', MAP {'a': encode('not a photo'), 'b': NULL::BLOB}) FROM (SELECT NULL::VARCHAR x);
+----
+the picture for option 'a': it is not a photo
+
+statement error
+SELECT typed_pick('x', 'which?', MAP {'a': png(100, 100), 'b': NULL::BLOB});
+----
+the picture for option 'a': this photo is 100 x 100 pixels
+
+# Other providers: photos and typed_box stop with a clear message, or skip just those rows in 'row' mode
+statement ok
+SET typed_profile = 'plain';
+
+statement error
+SELECT typed_is(png(1024, 768), 'is it broken?');
+----
+sending photos works only with provider 'jev' for now; profile 'plain' uses 'openai'. Add a Jev profile and SET typed_profile to its name
+
+statement error
+SELECT typed_is({photo: png(1024, 768), note: 'a mug'}, 'the note matches');
+----
+sending photos works only with provider 'jev'
+
+statement error
+SELECT typed_pick('a mug', 'which?', MAP {'r1': png(1024, 768), 'r2': NULL::BLOB});
+----
+sending photos works only with provider 'jev'
+
+statement error
+SELECT typed_box(png(1024, 768), 'the mug');
+----
+typed_box works only with provider 'jev' for now
+
+statement ok
+SET typed_on_stop = 'row';
+
+statement ok
+SET typed_dry_run = false;
+
+query II
+SELECT v.n, typed_prob(v.x, 'is it broken?').error FROM (VALUES (1, png(1024, 768)), (2, NULL)) v(n, x) ORDER BY 1;
+----
+1	skipped: sending photos works only with provider 'jev' for now; profile 'plain' uses 'openai'. Add a Jev profile and SET typed_profile to its name
+2	NULL
+
+query I
+SELECT typed_box(png(1024, 768), 'the mug').error;
+----
+skipped: typed_box works only with provider 'jev' for now; profile 'plain' uses 'openai'. Add a Jev profile and SET typed_profile to its name
+
+query I
+SELECT requests FROM typed_usage();
+----
+0
+
+statement ok
+SET typed_dry_run = true;
+
+statement ok
+RESET typed_on_stop;
+
+statement ok
+SET typed_profile = 'free_jev';
+
 # Limits are database-wide: SET SESSION cannot raise them
 statement ok
 SET typed_max_rows = 5;

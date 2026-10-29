@@ -199,6 +199,9 @@ double EstimateUsd(const QueryState &qs, const vector<Item> &items, double scale
 //! Checks a question against the provider's limits; throws with the allowed range.
 void CheckQuestion(const Question &q, const Capabilities &caps, const string &provider);
 
+//! Dollars with enough digits to be useful: 1.50, 0.0003, 0.00006. Never scientific notation.
+string Money(double usd);
+
 //! The message that ends a stopped job in 'error' mode.
 string StopMessage(ClientContext &context, QueryState &qs, const string &reason);
 
