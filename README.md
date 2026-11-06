@@ -5,7 +5,10 @@ probabilities from the model's own odds, and spending is capped from the first q
 
 New in 0.1.1: point it at a folder of photos and ask the same questions about each picture, compare a photo with
 its row's text, match photos against example pictures, or find where something is in a photo (Jev only, in
-preview). See [Photos](#photos).
+preview). See [Photos](#photos). The community store serves 0.1.1 for DuckDB 2.0 and later; older DuckDB installs
+get 0.1.0, which has no photo support.
+
+![A 65 second tour: sort photos, check a note against a photo, find the boots, match pictures](docs/typed_ai_photos.gif)
 
 Two providers ship: [TypeSafe Jev](https://docs.typesafe.ai) and any OpenAI-compatible server that returns
 `logprobs`, such as OpenAI or a local Ollama.
