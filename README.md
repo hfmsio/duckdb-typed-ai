@@ -8,7 +8,9 @@ its row's text, match photos against example pictures, or find where something i
 preview). See [Photos](#photos). The community store serves 0.1.1 for DuckDB 2.0 and later; older DuckDB installs
 get 0.1.0, which has no photo support.
 
-![A 65 second tour: sort photos, check a note against a photo, find the boots, match pictures](docs/typed_ai_photos.gif)
+![A two minute tour with a lost-and-found desk: ask about a whole row, odds and options from a table, price a job first, then photos](docs/typed_ai_tour.gif)
+
+The same tour as a sharper video: [docs/typed_ai_tour.mp4](docs/typed_ai_tour.mp4).
 
 Two providers ship: [TypeSafe Jev](https://docs.typesafe.ai) and any OpenAI-compatible server that returns
 `logprobs`, such as OpenAI or a local Ollama.
